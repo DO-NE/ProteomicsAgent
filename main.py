@@ -1,0 +1,179 @@
+"""CLI entry point for the metaproteomics agent system."""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+import click
+import requests
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from agent.orchestrator import Orchestrator
+from agent.state_manager import RunState, StateManager, new_run_state
+from config import check_tools, load_settings
+from taxon.registry import TaxonRegistry
+
+console = Console()
+
+
+def _llm_server_reachable(url: str) -> bool:
+    """Check if local OpenAI-compatible llama server is reachable."""
+
+    try:
+        requests.get(url.replace("/v1", "") + "/health", timeout=2)
+        return True
+    except Exception:
+        try:
+            requests.get(url + "/models", timeout=2)
+            return True
+        except Exception:
+            return False
+
+
+def _find_latest_run(output_dir: Path) -> tuple[Path, RunState] | None:
+    """Return latest run directory and state from output tree."""
+
+    states: list[tuple[Path, RunState]] = []
+    for state_path in output_dir.glob("*/run_state.json"):
+        state = StateManager.load(state_path.parent)
+        if state:
+            states.append((state_path.parent, state))
+    if not states:
+        return None
+    states.sort(key=lambda item: item[1].started_at, reverse=True)
+    return states[0]
+
+
+def _startup_checks() -> bool:
+    """Run tool checks and verify LLM server availability."""
+
+    settings = load_settings()
+    statuses = check_tools(settings)
+    if not all(statuses.values()):
+        console.print("[yellow]Warning: one or more tools are missing; pipeline stages may fail.[/yellow]")
+
+    if not _llm_server_reachable(settings.llama_server_url):
+        console.print(
+            Panel(
+                "LLM server not running. Start it first with: python main.py start-server",
+                title="LLM Server Error",
+                style="red",
+            )
+        )
+        return False
+    return True
+
+
+@click.group()
+def cli() -> None:
+    """Metaproteomics agent command group."""
+
+
+@cli.command("run")
+@click.option("--input", "input_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--db", "database_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--autonomy", type=click.Choice(["full", "balanced", "supervised"]), default=None)
+def run_cmd(input_path: Path, database_path: Path, autonomy: str | None) -> None:
+    """Start a new run or resume latest if user confirms."""
+
+    settings = load_settings()
+    if not _startup_checks():
+        raise SystemExit(1)
+
+    output_dir = Path(settings.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    latest = _find_latest_run(output_dir)
+
+    if latest is not None:
+        latest_dir, latest_state = latest
+        answer = input(
+            f"Found existing run from {latest_state.started_at} (completed: {latest_state.completed_stages}). Resume? (y/n) "
+        ).strip().lower()
+        if answer == "y":
+            orchestrator = Orchestrator(settings=settings, run_state=latest_state, run_dir=latest_dir)
+            orchestrator.run()
+            return
+
+    run_id = str(uuid.uuid4())
+    run_state = new_run_state(
+        run_id=run_id,
+        autonomy_mode=autonomy or settings.default_autonomy_mode,
+        input_files=[str(input_path)],
+        database_path=str(database_path),
+    )
+    run_dir = output_dir / run_id
+    orchestrator = Orchestrator(settings=settings, run_state=run_state, run_dir=run_dir)
+    orchestrator.run()
+
+
+@cli.command("resume")
+def resume_cmd() -> None:
+    """Resume the most recent run from output checkpoint."""
+
+    settings = load_settings()
+    if not _startup_checks():
+        raise SystemExit(1)
+
+    output_dir = Path(settings.output_dir)
+    latest = _find_latest_run(output_dir)
+    if latest is None:
+        console.print(Panel("No previous runs found in output directory.", style="red"))
+        raise SystemExit(1)
+
+    run_dir, state = latest
+    orchestrator = Orchestrator(settings=settings, run_state=state, run_dir=run_dir)
+    orchestrator.run()
+
+
+@cli.command("list-algorithms")
+def list_algorithms_cmd() -> None:
+    """List available taxon inference plugins."""
+
+    registry = TaxonRegistry()
+    table = Table(title="Available Taxon Algorithms")
+    table.add_column("Name", style="bold")
+    table.add_column("Description")
+    table.add_column("Internet")
+    for row in registry.list_plugins():
+        table.add_row(row["name"], row["description"], "yes" if row["requires_internet"] else "no")
+    console.print(table)
+
+
+@cli.command("check-tools")
+def check_tools_cmd() -> None:
+    """Print configured bioinformatics tool status."""
+
+    check_tools(load_settings())
+
+
+@cli.command("start-server")
+def start_server_cmd() -> None:
+    """Start llama-cpp-python OpenAI-compatible server."""
+
+    settings = load_settings()
+    if not settings.model_path:
+        console.print(Panel("MODEL_PATH is not configured in .env.", style="red"))
+        raise SystemExit(1)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "llama_cpp.server",
+        "--model",
+        settings.model_path,
+        "--n_gpu_layers",
+        "-1",
+        "--port",
+        "8000",
+    ]
+    console.print(Panel(f"Starting llama server:\n{' '.join(cmd)}", style="green"))
+    subprocess.run(cmd, check=False)
+
+
+if __name__ == "__main__":
+    cli()

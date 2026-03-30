@@ -1,0 +1,84 @@
+"""Configuration loading and external tool availability checks."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.table import Table
+
+
+@dataclass
+class Settings:
+    """Application settings loaded from environment variables."""
+
+    llm_backend: str = "llama"
+    llama_server_url: str = "http://localhost:8000/v1"
+    anthropic_api_key: str = ""
+    msfragger_path: str = ""
+    comet_path: str = ""
+    tpp_bin_path: str = ""
+    percolator_path: str = ""
+    output_dir: str = "./output"
+    default_autonomy_mode: str = "balanced"
+    database_path: str = ""
+    model_path: str = ""
+
+
+def load_settings() -> Settings:
+    """Load settings from .env and return a Settings dataclass instance."""
+
+    load_dotenv()
+    return Settings(
+        llm_backend=os.getenv("LLM_BACKEND", "llama").strip().lower(),
+        llama_server_url=os.getenv("LLAMA_SERVER_URL", "http://localhost:8000/v1").strip(),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        msfragger_path=os.getenv("MSFRAGGER_PATH", "").strip(),
+        comet_path=os.getenv("COMET_PATH", "").strip(),
+        tpp_bin_path=os.getenv("TPP_BIN_PATH", "").strip(),
+        percolator_path=os.getenv("PERCOLATOR_PATH", "").strip(),
+        output_dir=os.getenv("OUTPUT_DIR", "./output").strip(),
+        default_autonomy_mode=os.getenv("DEFAULT_AUTONOMY_MODE", "balanced").strip().lower(),
+        database_path=os.getenv("DATABASE_PATH", "").strip(),
+        model_path=os.getenv("MODEL_PATH", "").strip(),
+    )
+
+
+def _is_executable(path: Path) -> bool:
+    """Return True if path exists, is a file, and is executable."""
+
+    return path.exists() and path.is_file() and os.access(path, os.X_OK)
+
+
+def check_tools(settings: Settings | None = None) -> dict[str, bool]:
+    """Validate configured tool binaries and print a rich status table."""
+
+    cfg = settings or load_settings()
+    console = Console()
+
+    tool_paths: dict[str, str] = {
+        "MSFragger": cfg.msfragger_path,
+        "Comet": cfg.comet_path,
+        "TPP/PeptideProphet": str(Path(cfg.tpp_bin_path) / "PeptideProphet") if cfg.tpp_bin_path else "",
+        "TPP/ASAPRatio": str(Path(cfg.tpp_bin_path) / "ASAPRatio") if cfg.tpp_bin_path else "",
+        "TPP/ProteinProphet": str(Path(cfg.tpp_bin_path) / "ProteinProphet") if cfg.tpp_bin_path else "",
+        "Percolator": cfg.percolator_path,
+    }
+
+    table = Table(title="Configured Bioinformatics Tools")
+    table.add_column("Tool", style="bold")
+    table.add_column("Path", overflow="fold")
+    table.add_column("Status")
+
+    status: dict[str, bool] = {}
+    for tool, raw_path in tool_paths.items():
+        path = Path(raw_path).expanduser() if raw_path else Path("")
+        ok = _is_executable(path) if raw_path else False
+        status[tool] = ok
+        table.add_row(tool, str(path) if raw_path else "(not configured)", "✓ found" if ok else "✗ missing")
+
+    console.print(table)
+    return status
