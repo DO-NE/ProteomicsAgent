@@ -11,7 +11,7 @@ Metaprot Agent is a terminal-first, conversational metaproteomics analysis syste
 ## 3) Installation
 ### a) Create Conda environment
 ```bash
-conda env create -f environment.yml
+conda env create -f environment.yaml
 conda activate ProteomicsAgent
 ```
 
@@ -23,7 +23,9 @@ pip install llama-cpp-python[server] \
 
 ### c) Download a GGUF model
 ```bash
-huggingface-cli download bartowski/Qwen2.5-Coder-7B-Instruct-GGUF \
+pip install huggingface_hub
+
+hf download bartowski/Qwen2.5-Coder-7B-Instruct-GGUF \
   Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf --local-dir ~/models
 ```
 
