@@ -47,7 +47,18 @@ python -m llama_cpp.server --model <MODEL_PATH> --n_gpu_layers -1 --port 8000
 ## 6) Bioinformatics tool installation
 ### MSFragger
 - Project: https://msfragger.nesvilab.org/
-- Download JAR and set `MSFRAGGER_PATH` in `.env`.
+- Download JAR and make a wrapper direcotry: mkdir -p {path_to_wrapper_dir}
+- Make script: cat > {path_to_wrapper_dir}/msfragger <<'EOF'
+#!/usr/bin/env bash
+java -jar {path_to_downloaded_JAR} "$@"
+EOF
+- set `MSFRAGGER_PATH` in `.env`.
+
+### Comet
+- Project:
+- Download exe and set `COMET_PATH` in `.env`.
+- Activate the exe: chmod +x {path_to_exe}
+- Generate default parameter file: {path_to_exe} -p
 
 ### Trans-Proteomic Pipeline (TPP)
 - Project: https://tools.proteomecenter.org/wiki/index.php?title=Software:TPP
