@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from config import resolve_tpp_binary
 from .base import PipelineStage
 
 
@@ -23,8 +24,11 @@ class PeptideValidation(PipelineStage):
         outdir.mkdir(parents=True, exist_ok=True)
 
         if tool == "peptideprophet":
-            tpp_bin = Path(params.get("tpp_bin_path", ""))
-            cmd = [str(tpp_bin / "PeptideProphet"), str(pepxml), "DECOY=DECOY_", "NONPARAM", "ACCMASS"]
+            tpp_bin_path = params.get("tpp_bin_path", "")
+            binary = resolve_tpp_binary(tpp_bin_path, ["PeptideProphetParser", "PeptideProphet"])
+            if not binary:
+                raise RuntimeError(f"PeptideProphet binary not found in {tpp_bin_path}")
+            cmd = [binary, str(pepxml), "DECOY=DECOY_", "NONPARAM", "ACCMASS"]
             self.execute(cmd, self.name, "PeptideProphet", dry_run=dry_run)
             return str(outdir / f"interact-{pepxml.stem}.pep.xml")
 

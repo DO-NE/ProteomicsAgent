@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
+from config import resolve_tpp_binary
 from .base import PipelineStage
 
 
@@ -26,8 +27,13 @@ class Quantitation(PipelineStage):
         outdir.mkdir(parents=True, exist_ok=True)
 
         if tool == "asap_ratio":
-            tpp_bin = Path(params.get("tpp_bin_path", ""))
-            cmd = [str(tpp_bin / "ASAPRatio"), str(pepxml), "-F"]
+            tpp_bin_path = params.get("tpp_bin_path", "")
+            binary = resolve_tpp_binary(
+                tpp_bin_path, ["ASAPRatioPeptideParser", "ASAPRatioProteinParser", "ASAPRatio"]
+            )
+            if not binary:
+                raise RuntimeError(f"ASAPRatio binary not found in {tpp_bin_path}")
+            cmd = [binary, str(pepxml), "-F"]
             self.execute(cmd, self.name, "ASAPRatio", dry_run=dry_run)
             return str(pepxml)
 

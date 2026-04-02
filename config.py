@@ -53,6 +53,27 @@ def _is_executable(path: Path) -> bool:
     return path.exists() and path.is_file() and os.access(path, os.X_OK)
 
 
+def resolve_tpp_binary(tpp_bin_path: str, candidates: list[str]) -> str:
+    """Return the first executable candidate found in tpp_bin_path, or empty string."""
+
+    if not tpp_bin_path:
+        return ""
+    tpp_bin = Path(tpp_bin_path)
+    for name in candidates:
+        p = tpp_bin / name
+        if _is_executable(p):
+            return str(p)
+    return ""
+
+
+# Candidate binary names for TPP tools across versions (7.x renamed several binaries).
+_TPP_CANDIDATES: dict[str, list[str]] = {
+    "TPP/PeptideProphet": ["PeptideProphetParser", "PeptideProphet"],
+    "TPP/ASAPRatio": ["ASAPRatioPeptideParser", "ASAPRatioProteinParser", "ASAPRatio"],
+    "TPP/ProteinProphet": ["ProteinProphet"],
+}
+
+
 def check_tools(settings: Settings | None = None) -> dict[str, bool]:
     """Validate configured tool binaries and print a rich status table."""
 
@@ -62,9 +83,10 @@ def check_tools(settings: Settings | None = None) -> dict[str, bool]:
     tool_paths: dict[str, str] = {
         "MSFragger": cfg.msfragger_path,
         "Comet": cfg.comet_path,
-        "TPP/PeptideProphet": str(Path(cfg.tpp_bin_path) / "PeptideProphet") if cfg.tpp_bin_path else "",
-        "TPP/ASAPRatio": str(Path(cfg.tpp_bin_path) / "ASAPRatio") if cfg.tpp_bin_path else "",
-        "TPP/ProteinProphet": str(Path(cfg.tpp_bin_path) / "ProteinProphet") if cfg.tpp_bin_path else "",
+        **{
+            label: resolve_tpp_binary(cfg.tpp_bin_path, names)
+            for label, names in _TPP_CANDIDATES.items()
+        },
         "Percolator": cfg.percolator_path,
     }
 
