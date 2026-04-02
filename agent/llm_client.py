@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 
 from rich.console import Console
@@ -39,8 +40,37 @@ def _call_claude(messages: list[dict[str, str]], system_prompt: str, temperature
     return "".join(getattr(block, "text", "") for block in response.content)
 
 
+def _next_incomplete_stage(system_prompt: str) -> str:
+    """Parse completed stages from the system prompt and return the next ACTION."""
+    import json as _json
+
+    stages = [
+        "format_conversion", "peptide_id", "validation",
+        "quantitation", "protein_assignment",
+    ]
+    completed: list[str] = []
+    # Extract completed_stages from the run_state JSON embedded in the prompt
+    match = re.search(r'"completed_stages":\s*\[([^\]]*)\]', system_prompt)
+    if match:
+        completed = [s.strip().strip('"') for s in match.group(1).split(",") if s.strip()]
+
+    for stage in stages:
+        if stage not in completed:
+            return (
+                f"Running next pipeline stage automatically (no-LLM mode).\n"
+                f"<ACTION>\ntool: run_pipeline_stage\nstage: {stage}\nparams: {{}}\n</ACTION>"
+            )
+    return (
+        "All pipeline stages are complete.\n"
+        "<ACTION>\ntool: show_state\nparams: {}\n</ACTION>"
+    )
+
+
 def chat(messages: list[dict], system_prompt: str) -> str:
     """Send chat messages to configured backend with retries and return text output."""
+
+    if os.getenv("NO_LLM_MODE", "false").strip().lower() == "true":
+        return _next_incomplete_stage(system_prompt)
 
     backend = os.getenv("LLM_BACKEND", "llama").strip().lower()
     console = Console()

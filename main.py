@@ -66,6 +66,10 @@ def _startup_checks() -> bool:
     if not all(statuses.values()):
         console.print("[yellow]Warning: one or more tools are missing; pipeline stages may fail.[/yellow]")
 
+    if settings.no_llm_mode:
+        console.print("[yellow]Running in no-LLM mode. LLM server will not be used.[/yellow]")
+        return True
+
     if not _llm_server_reachable(settings.llama_server_url):
         console.print(
             Panel(
@@ -87,9 +91,12 @@ def cli() -> None:
 @click.option("--input", "input_path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--db", "database_path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--autonomy", type=click.Choice(["full", "balanced", "supervised"]), default=None)
-def run_cmd(input_path: Path, database_path: Path, autonomy: str | None) -> None:
+@click.option("--no-llm", "no_llm", is_flag=True, default=False, help="Run without LLM server.")
+def run_cmd(input_path: Path, database_path: Path, autonomy: str | None, no_llm: bool) -> None:
     """Start a new run or resume latest if user confirms."""
 
+    if no_llm:
+        os.environ["NO_LLM_MODE"] = "true"
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
@@ -184,6 +191,32 @@ def start_server_cmd() -> None:
     ]
     console.print(Panel(f"Starting llama server:\n{' '.join(cmd)}", style="green"))
     subprocess.run(cmd, check=False, env=_offline_env())
+
+
+@cli.command("run-pipeline")
+@click.option("--input", "input_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--db", "database_path", required=True, type=click.Path(exists=True, path_type=Path))
+def run_pipeline_cmd(input_path: Path, database_path: Path) -> None:
+    """Run the full pipeline non-interactively in no-LLM mode."""
+
+    os.environ["NO_LLM_MODE"] = "true"
+    settings = load_settings()
+    if not _startup_checks():
+        raise SystemExit(1)
+
+    output_dir = Path(settings.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    run_id = str(uuid.uuid4())
+    run_state = new_run_state(
+        run_id=run_id,
+        autonomy_mode="full",
+        input_files=[str(input_path)],
+        database_path=str(database_path),
+    )
+    run_dir = output_dir / run_id
+    orchestrator = Orchestrator(settings=settings, run_state=run_state, run_dir=run_dir)
+    orchestrator.run()
 
 
 if __name__ == "__main__":

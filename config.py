@@ -26,6 +26,7 @@ class Settings:
     default_autonomy_mode: str = "balanced"
     database_path: str = ""
     model_path: str = ""
+    no_llm_mode: bool = False
 
 
 def load_settings() -> Settings:
@@ -44,6 +45,7 @@ def load_settings() -> Settings:
         default_autonomy_mode=os.getenv("DEFAULT_AUTONOMY_MODE", "balanced").strip().lower(),
         database_path=os.getenv("DATABASE_PATH", "").strip(),
         model_path=os.getenv("MODEL_PATH", "").strip(),
+        no_llm_mode=os.getenv("NO_LLM_MODE", "false").strip().lower() == "true",
     )
 
 

@@ -44,6 +44,15 @@ This command launches:
 python -m llama_cpp.server --model <MODEL_PATH> --n_gpu_layers -1 --port 8000
 ```
 
+If the LLM server is unavailable, run with the `--no-llm` flag or set `NO_LLM_MODE=true` in `.env` to drive the pipeline directly:
+```bash
+# Interactive run without LLM
+python main.py run --input data/sample.mzML --db data/db.fasta --no-llm
+
+# Full non-interactive pipeline
+python main.py run-pipeline --input data/sample.mzML --db data/db.fasta
+```
+
 ## 6) Bioinformatics tool installation
 ### MSFragger
 - Project: https://msfragger.nesvilab.org/

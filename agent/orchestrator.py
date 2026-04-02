@@ -276,8 +276,56 @@ class Orchestrator:
             return self.export_report(str(params.get("format", "txt")))
         return {"status": "error", "message": f"Unknown tool: {tool}"}
 
+    # Ordered pipeline stages for no-LLM automatic execution.
+    PIPELINE_STAGES = [
+        "format_conversion",
+        "peptide_id",
+        "validation",
+        "quantitation",
+        "protein_assignment",
+    ]
+
+    def _next_incomplete_stage(self) -> str | None:
+        """Return the name of the next incomplete pipeline stage, or None."""
+        for stage in self.PIPELINE_STAGES:
+            if stage not in self.state.completed_stages:
+                return stage
+        return None
+
+    def _run_no_llm(self) -> None:
+        """Run pipeline stages sequentially without LLM, prompting between stages."""
+
+        self.console.print("[cyan]Running in no-LLM mode. Stages will execute automatically.[/cyan]")
+        while True:
+            stage = self._next_incomplete_stage()
+            if stage is None:
+                self.console.print(Panel("All pipeline stages complete!", style="green"))
+                self.console.print(f"[bold]Completed stages:[/bold] {', '.join(self.state.completed_stages)}")
+                for s, out in self.state.stage_outputs.items():
+                    self.console.print(f"  {s}: {out}")
+                break
+
+            self.console.print(f"\n[bold cyan]>>> Running stage: {stage}[/bold cyan]")
+            result = self.run_pipeline_stage(stage, {})
+            self.console.print(Panel(json.dumps(result, indent=2), title=f"Stage Result: {stage}"))
+
+            if result.get("status") != "ok":
+                self.console.print(f"[red]Stage {stage} failed. Stopping.[/red]")
+                break
+
+            next_stage = self._next_incomplete_stage()
+            if next_stage is not None:
+                answer = input("Continue to next stage? (y/n) ").strip().lower()
+                if answer != "y":
+                    self.console.print("[green]Session ended by user.[/green]")
+                    break
+
     def run(self) -> None:
         """Start interactive conversation loop and process LLM-directed actions."""
+
+        if self.settings.no_llm_mode:
+            self._run_no_llm()
+            return
 
         self.console.print("[green]Type 'exit' or 'quit' to end the session.[/green]")
         while True:
