@@ -18,12 +18,25 @@ Optional flags:
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+
+def _offline_env() -> dict:
+    """Return os.environ merged with offline/no-telemetry flags."""
+    return {
+        **os.environ,
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "LLAMA_CPP_DISABLE_TELEMETRY": "1",
+    }
 
 from taxon.registry import TaxonRegistry
 from visualization.report import export_tsv
@@ -92,7 +105,7 @@ def run_comet(mzml: Path, fasta: Path, comet_path: str, run_dir: Path) -> Path:
 
     cmd = [comet_path, f"-P{param_file}", str(mzml)]
     print(f"[peptide_id] Running Comet: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=_offline_env())
     if result.returncode != 0:
         print(f"[ERROR] Comet failed (rc={result.returncode}):\n{result.stderr}", file=sys.stderr)
         sys.exit(1)

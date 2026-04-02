@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from abc import ABC, abstractmethod
+
+
+def _offline_env() -> dict:
+    """Return os.environ merged with offline/no-telemetry flags."""
+    return {
+        **os.environ,
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "LLAMA_CPP_DISABLE_TELEMETRY": "1",
+    }
 
 
 class PipelineError(Exception):
@@ -40,7 +53,7 @@ class PipelineStage(ABC):
             print(f"[DRY RUN] {' '.join(cmd)}")
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, env=_offline_env())
         if result.returncode != 0:
             raise PipelineError(stage, tool, result.returncode, result.stderr)
         return result

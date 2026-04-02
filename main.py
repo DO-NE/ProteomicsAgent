@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import uuid
@@ -21,18 +22,26 @@ from taxon.registry import TaxonRegistry
 console = Console()
 
 
+def _offline_env() -> dict:
+    """Return os.environ merged with offline/no-telemetry flags."""
+    return {
+        **os.environ,
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "LLAMA_CPP_DISABLE_TELEMETRY": "1",
+    }
+
+
 def _llm_server_reachable(url: str) -> bool:
     """Check if local OpenAI-compatible llama server is reachable."""
 
     try:
-        requests.get(url.replace("/v1", "") + "/health", timeout=2)
+        requests.get(url + "/models", timeout=3)
         return True
     except Exception:
-        try:
-            requests.get(url + "/models", timeout=2)
-            return True
-        except Exception:
-            return False
+        return False
 
 
 def _find_latest_run(output_dir: Path) -> tuple[Path, RunState] | None:
@@ -168,11 +177,13 @@ def start_server_cmd() -> None:
         settings.model_path,
         "--n_gpu_layers",
         "-1",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8000",
     ]
     console.print(Panel(f"Starting llama server:\n{' '.join(cmd)}", style="green"))
-    subprocess.run(cmd, check=False)
+    subprocess.run(cmd, check=False, env=_offline_env())
 
 
 if __name__ == "__main__":
