@@ -24,7 +24,7 @@ class ProteinAssignment(PipelineStage):
         output_file = outdir / "proteins.prot.xml"
 
         tpp_bin = Path(params.get("tpp_bin_path", ""))
-        cmd = [str(tpp_bin / "ProteinProphet"), str(pepxml), str(output_file), "IPROPHET"]
+        cmd = [str(tpp_bin / "ProteinProphet"), str(pepxml.resolve()), str(output_file.resolve())]
         self.execute(cmd, self.name, "ProteinProphet", dry_run=dry_run)
         return str(output_file)
 

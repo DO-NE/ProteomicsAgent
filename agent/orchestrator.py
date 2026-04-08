@@ -162,7 +162,7 @@ class Orchestrator:
                 "peptide_id": "format_conversion",
                 "validation": "peptide_id",
                 "quantitation": "validation",
-                "protein_assignment": "quantitation",
+                "protein_assignment": "validation",
             }.get(stage)
             if previous:
                 input_path = self.state_manager.get_stage_output(previous) or input_path

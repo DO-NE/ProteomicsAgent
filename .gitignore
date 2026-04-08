@@ -1,0 +1,25 @@
+# Environment and secrets
+.env
+
+# Output and run data
+output/
+
+# Log and test files
+*.log
+*.txt
+run_log.txt
+peptideprophet_test.txt
+proteinprophet_test.txt
+comet.params.new
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Large data files
+*.mzML
+*.mzBIN
+*.fasta
+*.raw
+*.mgf

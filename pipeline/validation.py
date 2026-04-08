@@ -5,7 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from config import resolve_tpp_binary
-from .base import PipelineStage
+from .base import PipelineStage, PipelineError
+import shutil
 
 
 class PeptideValidation(PipelineStage):
@@ -30,7 +31,11 @@ class PeptideValidation(PipelineStage):
                 raise RuntimeError(f"PeptideProphet binary not found in {tpp_bin_path}")
             cmd = [binary, str(pepxml), "DECOY=DECOY_", "NONPARAM", "ACCMASS"]
             self.execute(cmd, self.name, "PeptideProphet", dry_run=dry_run)
-            return str(outdir / f"interact-{pepxml.stem}.pep.xml")
+
+            # PeptideProphet (TPP v7.3.0) modifies the input pepXML file in place.
+            dest = outdir / pepxml.name
+            shutil.copy2(str(pepxml), str(dest))
+            return str(dest)
 
         percolator_path = params.get("percolator_path", "")
         output_file = outdir / "percolator_psms.txt"
