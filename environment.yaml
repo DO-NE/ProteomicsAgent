@@ -18,6 +18,11 @@ dependencies:
     - seaborn>=0.13.0
     - pandas>=2.2.0
     - numpy>=1.26.0
+    # New: required by taxon.algorithms.abundance_em (multinomial-mixture EM plugin)
+    - scipy>=1.11.0
+    # Optional: enables non-trypsin in-silico digestion in abundance_em mapping_matrix
+    # (a pure-python trypsin fallback ships with the plugin if pyteomics is absent).
+    - pyteomics>=4.7.0
     - python-dotenv>=1.0.0
     - rich>=13.7.0
     - click>=8.1.0
