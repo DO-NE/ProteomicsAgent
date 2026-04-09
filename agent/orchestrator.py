@@ -54,6 +54,7 @@ class Orchestrator:
                 autonomy_mode=selected_autonomy,
                 input_files=input_files or [],
                 database_path=database_path or settings.database_path,
+                taxon_algorithm=settings.taxon_algorithm,
             )
             run_dir = base_output / run_id
 
@@ -198,15 +199,40 @@ class Orchestrator:
         return {"status": "ok", "output": output_path, "stage": stage}
 
     def run_taxon_inference(self, algorithm: str, params: dict) -> dict:
-        """Run taxonomic inference from peptides in quantitation output."""
+        """Run taxonomic inference using peptides from validation pepXML."""
 
-        quant_file = Path(self.state_manager.get_stage_output("quantitation") or "")
+        # --- get peptide sequences from validation pepXML ---
+        pepxml_path = self.state_manager.get_stage_output("validation")
         peptides: list[str] = []
-        if quant_file.exists():
-            lines = quant_file.read_text(encoding="utf-8").splitlines()[1:]
-            peptides = [line.split("\t")[0] for line in lines if line.strip()]
+        spectral_counts: dict[str, int] = {}
 
-        config = {"database_path": params.get("database_path", self.state.database_path)}
+        if pepxml_path and Path(pepxml_path).exists():
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(pepxml_path)
+            root = tree.getroot()
+            ns = root.tag.split("}")[0].strip("{") if root.tag.startswith("{") else ""
+            def q(name):
+                return f"{{{ns}}}{name}" if ns else name
+            for hit in root.iter(q("search_hit")):
+                pep = hit.attrib.get("peptide", "")
+                if pep:
+                    peptides.append(pep)
+                    spectral_counts[pep] = spectral_counts.get(pep, 0) + 1
+
+        if not peptides:
+            return {
+                "status": "error",
+                "message": "No peptides found in validation output. "
+                        "Ensure validation stage completed successfully."
+            }
+
+        # --- build config for plugin ---
+        config = {
+            "fasta_path": params.get("fasta_path", self.state.database_path),
+            "database_path": params.get("database_path", self.state.database_path),
+            "spectral_counts": spectral_counts,
+        }
+
         results = self.taxon_registry.run(algorithm, peptides, config)
         self.latest_taxon_results = results
         self.state.taxon_algorithm = algorithm
@@ -214,11 +240,16 @@ class Orchestrator:
 
         taxon_dir = self.run_dir / "taxon"
         tsv_path = export_tsv(results, taxon_dir, "results.tsv")
+
+        # mark complete so resume works
+        self.state_manager.mark_stage_complete("taxon_inference", str(tsv_path))
+        self.state = self.state_manager.state or self.state
+
         return {
             "status": "ok",
             "taxon_count": len(results),
             "top_taxon": results[0].taxon_name if results else "none",
-            "output": tsv_path,
+            "output": str(tsv_path),
         }
 
     def show_state(self) -> dict:
@@ -284,6 +315,7 @@ class Orchestrator:
         "validation",
         "quantitation",
         "protein_assignment",
+        "taxon_inference",
     ]
 
     def _next_incomplete_stage(self) -> str | None:
@@ -312,7 +344,12 @@ class Orchestrator:
                 break
 
             self.console.print(f"\n[bold cyan]>>> Running stage: {stage}[/bold cyan]")
-            result = self.run_pipeline_stage(stage, {})
+            if stage == "taxon_inference":
+                algorithm = os.getenv("TAXON_ALGORITHM") or self.state.taxon_algorithm or "abundance_em"
+                self.console.print(f"[cyan]Using taxon algorithm: {algorithm}[/cyan]")
+                result = self.run_taxon_inference(algorithm, {})
+            else:
+                result = self.run_pipeline_stage(stage, {})
             self.console.print(Panel(json.dumps(result, indent=2), title=f"Stage Result: {stage}"))
 
             if result.get("status") != "ok":

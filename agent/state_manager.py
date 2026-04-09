@@ -81,13 +81,21 @@ class StateManager:
         return self.state.stage_outputs.get(stage_name)
 
 
-def new_run_state(run_id: str, autonomy_mode: str, input_files: list[str], database_path: str) -> RunState:
+def new_run_state(
+    run_id: str,
+    autonomy_mode: str,
+    input_files: list[str],
+    database_path: str,
+    taxon_algorithm: str = "unipept_api",
+) -> RunState:
     """Create a fresh RunState with current UTC timestamp."""
 
+    effective_algo = os.getenv("TAXON_ALGORITHM") or taxon_algorithm
     return RunState(
         run_id=run_id,
         started_at=datetime.now(timezone.utc).isoformat(),
         autonomy_mode=autonomy_mode,
         input_files=input_files,
         database_path=database_path,
+        taxon_algorithm=effective_algo,
     )
