@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from pathlib import Path
@@ -295,6 +296,11 @@ class Orchestrator:
     def _run_no_llm(self) -> None:
         """Run pipeline stages sequentially without LLM, prompting between stages."""
 
+        algorithm = os.getenv("TAXON_ALGORITHM") or self.state.taxon_algorithm or "abundance_em"
+        self.console.print(
+            f"[cyan]Taxon algorithm: {algorithm} "
+            f"(from {'env' if os.getenv('TAXON_ALGORITHM') else 'state'})[/cyan]"
+        )
         self.console.print("[cyan]Running in no-LLM mode. Stages will execute automatically.[/cyan]")
         while True:
             stage = self._next_incomplete_stage()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,7 +43,11 @@ class StateManager:
         if not state_path.exists():
             return None
         payload = json.loads(state_path.read_text(encoding="utf-8"))
-        return RunState(**payload)
+        loaded_state = RunState(**payload)
+        env_algo = os.getenv("TAXON_ALGORITHM")
+        if env_algo:
+            loaded_state.taxon_algorithm = env_algo
+        return loaded_state
 
     def save(self, state: RunState) -> None:
         """Save provided run state to disk and set as current state."""

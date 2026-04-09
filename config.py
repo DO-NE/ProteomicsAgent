@@ -27,6 +27,7 @@ class Settings:
     database_path: str = ""
     model_path: str = ""
     no_llm_mode: bool = False
+    taxon_algorithm: str = os.getenv("TAXON_ALGORITHM", "unipept_api")
 
 
 def load_settings() -> Settings:
@@ -46,6 +47,7 @@ def load_settings() -> Settings:
         database_path=os.getenv("DATABASE_PATH", "").strip(),
         model_path=os.getenv("MODEL_PATH", "").strip(),
         no_llm_mode=os.getenv("NO_LLM_MODE", "false").strip().lower() == "true",
+        taxon_algorithm=os.getenv("TAXON_ALGORITHM", "unipept_api").strip(),
     )
 
 
