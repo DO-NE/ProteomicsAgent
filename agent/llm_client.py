@@ -24,10 +24,24 @@ def _call_llama(messages: list[dict[str, str]], temperature: float) -> str:
     return response.choices[0].message.content or ""
 
 
+def _call_openai_compatible(messages: list[dict[str, str]], temperature: float) -> str:
+    from openai import OpenAI
+
+    client = OpenAI(
+        base_url=os.getenv("OPENAI_API_URL", "https://api.openai.com/v1"),
+        api_key=os.getenv("OPENAI_API_KEY", "none"),
+    )
+    response = client.chat.completions.create(
+        model="local",
+        temperature=temperature,
+        messages=messages,
+    )
+    return response.choices[0].message.content or ""
+
+
 def _call_claude(messages: list[dict[str, str]], system_prompt: str, temperature: float) -> str:
     import anthropic
-
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+    client = anthropic.Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"), api_key=os.getenv("ANTHROPIC_API_KEY", ""))
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=2048,
@@ -83,6 +97,8 @@ def chat(messages: list[dict], system_prompt: str) -> str:
         try:
             if backend == "claude":
                 return _call_claude(prepared_messages, system_prompt, temperature=0.2)
+            elif backend == "openai":
+                return _call_openai_compatible(prepared_messages, temperature=0.2)
             return _call_llama(prepared_messages, temperature=0.2)
         except Exception as exc:  # noqa: BLE001
             console.print(f"[yellow]LLM request failed (attempt {attempt}/3): {exc}[/yellow]")

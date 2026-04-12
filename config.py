@@ -17,7 +17,10 @@ class Settings:
 
     llm_backend: str = "llama"
     llama_server_url: str = "http://localhost:8000/v1"
+    openai_api_url: str = "https://api.openai.com/v1"
+    openai_api_key: str = ""
     anthropic_api_key: str = ""
+    anthropic_base_url: str = "https://api.anthropic.com/v1"
     msfragger_path: str = ""
     comet_path: str = ""
     tpp_bin_path: str = ""
@@ -37,7 +40,12 @@ def load_settings() -> Settings:
     return Settings(
         llm_backend=os.getenv("LLM_BACKEND", "llama").strip().lower(),
         llama_server_url=os.getenv("LLAMA_SERVER_URL", "http://localhost:8000/v1").strip(),
+        openai_api_url=os.getenv("OPENAI_API_URL", "https://api.openai.com/v1").strip(),
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_model_id=os.getenv("OPENAI_MODEL_ID", "gpt-5.4").strip(),
+        anthropic_base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1").strip(),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        anthropic_model_id=os.getenv("ANTHROPIC_MODEL_ID", "claude-sonnet-4-6").strip(),
         msfragger_path=os.getenv("MSFRAGGER_PATH", "").strip(),
         comet_path=os.getenv("COMET_PATH", "").strip(),
         tpp_bin_path=os.getenv("TPP_BIN_PATH", "").strip(),
