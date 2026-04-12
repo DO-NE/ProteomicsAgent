@@ -32,6 +32,7 @@ _OX_RE = re.compile(r"\bOX=(\d+)")
 _OS_RE = re.compile(r"\bOS=(.+?)(?=\s+(?:OX|GN|PE|SV)=|$)")
 _BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
 _GENERIC_TAXID_RE = re.compile(r"\btaxon[_:]?(\d+)\b", re.IGNORECASE)
+_SPECIES_RE = re.compile(r'\bspecies="([^"]+)"')
 
 
 def build_mapping_matrix(
@@ -41,6 +42,8 @@ def build_mapping_matrix(
     missed_cleavages: int = 2,
     min_length: int = 7,
     max_length: int = 50,
+    exclude_prefixes: list | None = None,
+    pepxml_protein_map: dict | None = None,
 ) -> tuple:
     """Build a peptide-taxon mapping matrix from a FASTA database.
 
@@ -110,12 +113,20 @@ def build_mapping_matrix(
     # taxon first lets us digest each taxon's pooled proteome in one pass.
     # taxon_key -> (taxon_id, taxon_name, list_of_sequences)
     taxon_buckets: dict = {}
+    protein_taxon: dict = {}  # accession -> taxon_key (for substring matching)
+    protein_seqs: dict = {}   # accession -> sequence (for substring matching)
     for header, seq in _iter_fasta(fasta):
+        if _should_exclude(header, exclude_prefixes):
+            continue
+        accession = _extract_accession(header)
         taxon_id, taxon_name = _parse_header(header)
         key = (taxon_id, taxon_name)
         if key not in taxon_buckets:
             taxon_buckets[key] = []
         taxon_buckets[key].append(seq)
+        protein_taxon[accession] = key
+        if pepxml_protein_map is not None:
+            protein_seqs[accession] = seq
 
     if not taxon_buckets:
         logger.warning("FASTA file %s yielded no parseable records", fasta_path)
@@ -173,6 +184,45 @@ def build_mapping_matrix(
         empty = np.zeros((P, 0), dtype=np.int8)
         return empty, peptide_list, []
 
+    # Substring matching for unmatched peptides using pepXML protein context.
+    n_exact = len(rows)
+    n_substring_matched = 0
+    if pepxml_protein_map:
+        matched_row_set = set(rows)
+        unmatched_indices = set(range(P)) - matched_row_set
+        if unmatched_indices:
+            taxon_col = {key: col for col, key in enumerate(surviving_columns)}
+            protein_digest_cache: dict = {}
+            for idx in unmatched_indices:
+                pep = peptide_list[idx]
+                proteins = pepxml_protein_map.get(pep, set())
+                if not proteins:
+                    continue
+                matched_taxa: set = set()
+                for protein_acc in proteins:
+                    tk = protein_taxon.get(protein_acc)
+                    if not tk or tk not in taxon_col or tk in matched_taxa:
+                        continue
+                    if protein_acc not in protein_digest_cache:
+                        seq = protein_seqs.get(protein_acc, "")
+                        protein_digest_cache[protein_acc] = set(
+                            _digest(seq, enzyme=enzyme,
+                                    missed_cleavages=missed_cleavages,
+                                    min_length=min_length,
+                                    max_length=max_length)
+                        )
+                    if _has_substring_match(pep, protein_digest_cache[protein_acc]):
+                        rows.append(idx)
+                        cols.append(taxon_col[tk])
+                        n_substring_matched += 1
+                        matched_taxa.add(tk)
+        if n_substring_matched > 0:
+            logger.info(
+                "Substring matching: %d additional peptide-taxon assignments "
+                "(%d exact, %d substring)",
+                n_substring_matched, n_exact, n_substring_matched,
+            )
+
     data = np.ones(len(rows), dtype=np.int8)
     sparse = csc_matrix((data, (rows, cols)), shape=(P, T), dtype=np.int8)
     # Densify in one shot. The trade-off threshold from the spec
@@ -227,35 +277,43 @@ def _parse_header(header: str) -> tuple:
     """Extract a ``(taxon_id, taxon_name)`` pair from a FASTA header.
 
     Tries the following parsers in order:
-    1. UniProt-style ``OS=`` / ``OX=`` fields.
-    2. NCBI-style ``[Organism Name]`` brackets.
-    3. Inline ``taxon_<id>`` markers.
-    4. Pipe-prefixed organism (``>OrganismName|accession|...``).
+    1. UniProt-style ``OS=`` / ``OX=`` fields (with taxon name normalization).
+    2. GeneMark-style ``species="..."`` field.
+    3. NCBI-style ``[Organism Name]`` brackets.
+    4. Inline ``taxon_<id>`` markers.
+    5. Pipe-prefixed organism (``>OrganismName|accession|...``).
     """
     if not header:
-        return ("0", "unknown")
+        return ("0", "unclassified")
 
     # 1. UniProt OS / OX
     ox = _OX_RE.search(header)
     os_match = _OS_RE.search(header)
     if os_match:
-        name = os_match.group(1).strip()
+        raw_name = os_match.group(1).strip()
+        name = _normalize_taxon_name(raw_name)
         taxon_id = ox.group(1) if ox else _slug(name)
         return (taxon_id, name)
 
-    # 2. NCBI bracketed organism
+    # 2. GeneMark species="..."
+    species_match = _SPECIES_RE.search(header)
+    if species_match:
+        name = species_match.group(1).strip()
+        return (_slug(name), name)
+
+    # 3. NCBI bracketed organism
     bracket = _BRACKET_RE.search(header)
     if bracket:
         name = bracket.group(1).strip()
         taxid = ox.group(1) if ox else _slug(name)
         return (taxid, name)
 
-    # 3. Inline taxon_<id>
+    # 4. Inline taxon_<id>
     inline = _GENERIC_TAXID_RE.search(header)
     if inline:
         return (inline.group(1), f"taxon_{inline.group(1)}")
 
-    # 4. Pipe-prefixed organism: >OrganismName|accession|description
+    # 5. Pipe-prefixed organism: >OrganismName|accession|description
     if "|" in header:
         first = header.split("|", 1)[0].strip()
         # Heuristic: treat as an organism only if it has at least one alpha
@@ -263,13 +321,58 @@ def _parse_header(header: str) -> tuple:
         if first and first.lower() not in {"sp", "tr", "gi", "ref", "gb"} and re.search(r"[A-Za-z]", first):
             return (_slug(first), first)
 
-    return ("0", "unknown")
+    return ("0", "unclassified")
 
 
 def _slug(name: str) -> str:
     """Make a deterministic id-like slug from a name when no real id exists."""
     cleaned = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
     return cleaned or "unknown"
+
+
+def _normalize_taxon_name(name: str) -> str:
+    """Strip strain/subspecies details in trailing parentheses.
+
+    ``"Pseudomonas aeruginosa (strain ATCC 15692 ...)"``
+    → ``"Pseudomonas aeruginosa"``
+    """
+    stripped = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
+    return stripped or name
+
+
+def _should_exclude(header: str, exclude_prefixes: list | None) -> bool:
+    """Return *True* if the FASTA header matches any exclusion prefix."""
+    if not exclude_prefixes:
+        return False
+    header_lower = header.lower()
+    return any(header_lower.startswith(p.lower()) for p in exclude_prefixes)
+
+
+def _extract_accession(header: str) -> str:
+    """Return the first whitespace-delimited token of a FASTA header."""
+    return header.split()[0] if header else ""
+
+
+def _has_substring_match(
+    observed: str,
+    theoretical_set: set,
+    min_ratio: float = 0.7,
+) -> bool:
+    """Check containment between *observed* and any member of *theoretical_set*.
+
+    A match requires that one sequence is a substring of the other **and**
+    ``min(len_obs, len_theo) / max(len_obs, len_theo) >= min_ratio``.
+    """
+    obs_len = len(observed)
+    for theo in theoretical_set:
+        theo_len = len(theo)
+        shorter = min(obs_len, theo_len)
+        longer = max(obs_len, theo_len)
+        if shorter / longer < min_ratio:
+            continue
+        if observed in theo or theo in observed:
+            return True
+    return False
 
 
 # --- digestion ---------------------------------------------------------------
