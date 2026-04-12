@@ -32,7 +32,7 @@ Available tools:
 
 - ask_question: Ask the user a question when you need input before proceeding.
     Use this when you need clarification, a decision, or parameter input from the user.
-    The user will see numbered options and can also provide custom free-text input.
+    The user will see an interactive list and can choose with arrow keys or provide custom free-text input.
     params: {{
         "question": "Clear, specific question for the user",
         "type": "clarification | decision | parameter",

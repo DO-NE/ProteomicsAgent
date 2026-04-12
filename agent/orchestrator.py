@@ -389,12 +389,14 @@ class Orchestrator:
         if not isinstance(params, dict):
             params = {}
 
+        # ask_question is user-facing by nature — skip the approval gate
+        if tool == "ask_question":
+            return self.ask_question(params)
+
         approved, params = self._approve_action(tool, str(stage) if stage else None, params)
         if not approved:
             return {"status": "cancelled", "message": "Action cancelled by user."}
 
-        if tool == "ask_question":
-            return self.ask_question(params)
         if tool == "run_pipeline_stage":
             return self.run_pipeline_stage(str(stage), params)
         if tool == "run_taxon_inference":
@@ -483,7 +485,7 @@ class Orchestrator:
 
             self.history.append({"role": "user", "content": user_text})
             system_prompt = self._build_system_prompt()
-            response = llm_client.chat(self.history, system_prompt)
+            response = llm_client.chat(self.history, system_prompt, self.settings)
             self.console.print(Markdown(response))
             self.history.append({"role": "assistant", "content": response})
 
@@ -492,13 +494,12 @@ class Orchestrator:
                 result = self._execute_action(action)
 
                 # ask_question: feed the answer back to the LLM automatically
-                if action.get("tool") == "ask_question" and result.get("status") == "ok":
-                    answer = result["answer"]
-                    self.history.append({
-                        "role": "assistant",
-                        "content": f"User selected: {answer}",
-                    })
-                    pending_input = answer
+                if action.get("tool") == "ask_question":
+                    if result.get("status") == "ok":
+                        pending_input = result["answer"]
+                        continue
+                    # cancelled — let the user type the next message
+                    self.console.print("[dim]Question cancelled.[/dim]")
                     continue
 
                 tool_msg = f"Tool result: {json.dumps(result, indent=2)}"
