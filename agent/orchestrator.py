@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -68,6 +69,17 @@ class Orchestrator:
             self.state.autonomy_mode = input("Select autonomy mode (full/balanced/supervised): ").strip().lower() or "balanced"
             self.state_manager.save(self.state)
 
+        self.log_path = self.run_dir / "chat.log"
+        self._turn = 0
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.log_path.open("a", encoding="utf-8") as _f:
+            _f.write(
+                f"\n{'═' * 80}\n"
+                f"SESSION STARTED: {ts} | Run ID: {self.state.run_id} | Backend: {settings.llm_backend}\n"
+                f"{'═' * 80}\n"
+            )
+
         self.stages = {
             "format_conversion": FormatConversion(),
             "peptide_id": PeptideIdentification(),
@@ -104,8 +116,23 @@ class Orchestrator:
             completed_stages=", ".join(self.state.completed_stages),
         )
 
+    def _log_event(self, label: str, content: str) -> None:
+        """Append a labelled, timestamped event block to the chat log file."""
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sep = "─" * 80
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n{sep}\n[{ts}] {label}\n{sep}\n{content}\n")
+
+    _MAX_ACTION_RETRIES = 2
+
     def _parse_action(self, response: str) -> dict | None:
-        """Extract action dictionary from LLM ACTION block."""
+        """Extract and validate action dictionary from LLM ACTION block.
+
+        Returns None when:
+        - No <ACTION> block is present.
+        - The params value is not valid JSON.
+        - The required 'tool' field is absent.
+        """
 
         match = re.search(r"<ACTION>(.*?)</ACTION>", response, flags=re.DOTALL)
         if not match:
@@ -119,10 +146,60 @@ class Orchestrator:
             key = key.strip()
             value = value.strip()
             if key == "params":
-                action[key] = json.loads(value) if value else {}
+                if not value:
+                    action[key] = {}
+                else:
+                    try:
+                        action[key] = json.loads(value)
+                    except json.JSONDecodeError as exc:
+                        self.console.print(
+                            f"[yellow]Warning: malformed params JSON in ACTION block: {exc}[/yellow]"
+                        )
+                        return None
             else:
                 action[key] = value
+
+        if not action.get("tool"):
+            self.console.print("[yellow]Warning: ACTION block is missing the 'tool' field.[/yellow]")
+            return None
+
         return action
+
+    def _request_action_repair(self, bad_response: str, attempt: int) -> str:
+        """Re-query the LLM with a targeted correction when the action block was invalid.
+
+        Injects a correction message into a *temporary* history copy so that
+        self.history is never polluted with the repair exchange.
+        """
+
+        raw_match = re.search(r"<ACTION>.*?</ACTION>", bad_response, flags=re.DOTALL)
+        raw_block = raw_match.group(0) if raw_match else "(no <ACTION> block found)"
+
+        correction = (
+            "Your previous response contained an invalid ACTION block that could not be "
+            "parsed:\n\n"
+            f"{raw_block}\n\n"
+            "Common causes:\n"
+            "  • params value is not valid JSON (use double-quoted keys, no trailing commas)\n"
+            "  • 'tool' field is missing\n\n"
+            "Please respond **only** with a corrected ACTION block using this exact format:\n\n"
+            "<ACTION>\n"
+            "tool: <run_pipeline_stage | run_taxon_inference | show_state | "
+            "generate_figures | export_report | ask_question>\n"
+            "stage: <stage_name>  (only required for run_pipeline_stage)\n"
+            'params: {"key": "value"}  (must be valid JSON; use {} if no params needed)\n'
+            "</ACTION>\n\n"
+            f"Repair attempt {attempt}/{self._MAX_ACTION_RETRIES}."
+        )
+
+        self._log_event(
+            f"TURN {self._turn} — ACTION REPAIR PROMPT (attempt {attempt}/{self._MAX_ACTION_RETRIES})",
+            correction,
+        )
+
+        repair_history = self.history + [{"role": "user", "content": correction}]
+        system_prompt = self._build_system_prompt()
+        return llm_client.chat(repair_history, system_prompt, self.settings)
 
     def _approve_action(self, tool: str, stage: str | None, params: dict) -> tuple[bool, dict]:
         """Apply autonomy mode gating and optionally allow param edits."""
@@ -483,15 +560,69 @@ class Orchestrator:
                     self.console.print("[green]Session ended.[/green]")
                     break
 
+            self._turn += 1
             self.history.append({"role": "user", "content": user_text})
+            self._log_event(f"TURN {self._turn} — USER MESSAGE", user_text)
+
             system_prompt = self._build_system_prompt()
+            self._log_event(f"TURN {self._turn} — SYSTEM PROMPT", system_prompt)
+            self._log_event(
+                f"TURN {self._turn} — CONVERSATION HISTORY (sent to LLM)",
+                json.dumps(self.history, indent=2, ensure_ascii=False),
+            )
+
             response = llm_client.chat(self.history, system_prompt, self.settings)
             self.console.print(Markdown(response))
             self.history.append({"role": "assistant", "content": response})
+            self._log_event(f"TURN {self._turn} — LLM RESPONSE", response)
+
+            raw_action_match = re.search(r"<ACTION>.*?</ACTION>", response, flags=re.DOTALL)
+            if raw_action_match:
+                self._log_event(
+                    f"TURN {self._turn} — RAW ACTION BLOCK [PRE-EXECUTE]",
+                    raw_action_match.group(0),
+                )
 
             action = self._parse_action(response)
+
+            # Fail-safe: model produced an action block but it was invalid → repair loop
+            if raw_action_match and action is None:
+                self.console.print(
+                    "[yellow]Invalid ACTION block detected — attempting repair...[/yellow]"
+                )
+                for attempt in range(1, self._MAX_ACTION_RETRIES + 1):
+                    repair_response = self._request_action_repair(response, attempt)
+                    self._log_event(
+                        f"TURN {self._turn} — ACTION REPAIR RESPONSE (attempt {attempt}/{self._MAX_ACTION_RETRIES})",
+                        repair_response,
+                    )
+                    raw_repair_match = re.search(r"<ACTION>.*?</ACTION>", repair_response, flags=re.DOTALL)
+                    if raw_repair_match:
+                        self._log_event(
+                            f"TURN {self._turn} — RAW ACTION BLOCK [REPAIR attempt {attempt}] [PRE-EXECUTE]",
+                            raw_repair_match.group(0),
+                        )
+                    action = self._parse_action(repair_response)
+                    if action:
+                        self.console.print(f"[green]Action repaired on attempt {attempt}.[/green]")
+                        break
+                else:
+                    self.console.print(
+                        f"[red]Action repair failed after {self._MAX_ACTION_RETRIES} attempts — "
+                        "skipping action.[/red]"
+                    )
+                    self._log_event(
+                        f"TURN {self._turn} — ACTION REPAIR FAILED",
+                        f"All {self._MAX_ACTION_RETRIES} repair attempts exhausted. Action skipped.",
+                    )
+
             if action:
                 result = self._execute_action(action)
+
+                self._log_event(
+                    f"TURN {self._turn} — ACTION RESULT",
+                    json.dumps(result, indent=2, ensure_ascii=False),
+                )
 
                 # ask_question: feed the answer back to the LLM automatically
                 if action.get("tool") == "ask_question":
