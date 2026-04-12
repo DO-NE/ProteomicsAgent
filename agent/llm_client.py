@@ -1,125 +1,290 @@
-"""LLM chat client supporting llama-cpp, OpenAI-compatible, and Anthropic backends."""
+"""LLM chat client supporting llama-cpp, OpenAI-compatible, and Anthropic backends.
+
+All backends return an LLMResponse containing separate text and tool_call fields,
+using each provider's native tool/function-calling API.
+"""
 
 from __future__ import annotations
 
-import re
+import json
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from rich.console import Console
+
+from agent.tools import TOOLS_ANTHROPIC, tools_for_openai
 
 if TYPE_CHECKING:
     from config import Settings
 
 
-def _call_llama(
-    messages: list[dict[str, str]],
-    temperature: float,
-    base_url: str,
-) -> str:
-    from openai import OpenAI
+# Injected into the system prompt only when a local llama model doesn't support
+# native function calling.  Claude and OpenAI backends never see this block.
+_ACTION_FALLBACK_INSTRUCTIONS = """
+You do not have native tool-calling support. Instead, when you need to call a tool,
+emit exactly one ACTION block in your response using this format:
 
-    client = OpenAI(base_url=base_url, api_key="none")
-    response = client.chat.completions.create(
-        model="local",
-        temperature=temperature,
-        messages=messages,
-    )
-    return response.choices[0].message.content or ""
+<ACTION>
+tool: <run_pipeline_stage | run_taxon_inference | show_state | generate_figures | export_report | ask_question>
+stage: <stage_name>   (only for run_pipeline_stage)
+params: {"key": "value"}   (valid JSON; use {} if no params)
+</ACTION>
+
+Available tools and their params are described in the system prompt above.
+Never emit more than one ACTION block per response.
+"""
 
 
-def _call_openai_compatible(
-    messages: list[dict[str, str]],
-    temperature: float,
-    base_url: str,
-    api_key: str,
-    model: str,
-) -> str:
-    from openai import OpenAI
+@dataclass
+class LLMResponse:
+    """Structured response from the LLM."""
 
-    if not api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set. Set it in .env or environment variables."
-        )
-    client = OpenAI(base_url=base_url, api_key=api_key)
-    response = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=messages,
-    )
-    return response.choices[0].message.content or ""
+    text: str
+    tool_call: dict | None = None  # {"id": str, "name": str, "input": dict}
 
+
+# ---------------------------------------------------------------------------
+# History conversion helpers
+# ---------------------------------------------------------------------------
+
+def _to_claude_messages(history: list[dict]) -> list[dict]:
+    """Convert internal history to Anthropic messages format."""
+    messages = []
+    for msg in history:
+        role = msg["role"]
+        if role in {"user", "assistant"}:
+            messages.append({"role": role, "content": msg["content"]})
+        elif role == "assistant_with_tool":
+            content: list[dict] = []
+            if msg.get("text"):
+                content.append({"type": "text", "text": msg["text"]})
+            tc = msg["tool_call"]
+            content.append(
+                {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": tc["input"]}
+            )
+            messages.append({"role": "assistant", "content": content})
+        elif role == "tool_result":
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": msg["tool_use_id"],
+                            "content": msg["content"],
+                        }
+                    ],
+                }
+            )
+    return messages
+
+
+def _to_openai_messages(history: list[dict], system_prompt: str) -> list[dict]:
+    """Convert internal history to OpenAI messages format."""
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    for msg in history:
+        role = msg["role"]
+        if role in {"user", "assistant"}:
+            messages.append({"role": role, "content": msg["content"]})
+        elif role == "assistant_with_tool":
+            tc = msg["tool_call"]
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": msg.get("text") or None,
+                    "tool_calls": [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": json.dumps(tc["input"]),
+                            },
+                        }
+                    ],
+                }
+            )
+        elif role == "tool_result":
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": msg["tool_use_id"],
+                    "content": msg["content"],
+                }
+            )
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Backend implementations
+# ---------------------------------------------------------------------------
 
 def _call_claude(
-    messages: list[dict[str, str]],
+    history: list[dict],
     system_prompt: str,
     temperature: float,
     base_url: str,
     api_key: str,
     model: str,
-) -> str:
+) -> LLMResponse:
     import anthropic
 
     if not api_key:
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set. Set it in .env or environment variables."
         )
+
     client = anthropic.Anthropic(base_url=base_url, api_key=api_key)
     response = client.messages.create(
         model=model,
         max_tokens=2048,
         temperature=temperature,
         system=system_prompt,
-        messages=[m for m in messages if m.get("role") in {"user", "assistant"}],
-    )
-    if not response.content:
-        return ""
-    return "".join(getattr(block, "text", "") for block in response.content)
-
-
-def _next_incomplete_stage(system_prompt: str) -> str:
-    """Parse completed stages from the system prompt and return the next ACTION."""
-
-    stages = [
-        "format_conversion", "peptide_id", "validation",
-        "quantitation", "protein_assignment",
-    ]
-    completed: list[str] = []
-    # Extract completed_stages from the run_state JSON embedded in the prompt
-    match = re.search(r'"completed_stages":\s*\[([^\]]*)\]', system_prompt)
-    if match:
-        completed = [s.strip().strip('"') for s in match.group(1).split(",") if s.strip()]
-
-    for stage in stages:
-        if stage not in completed:
-            return (
-                f"Running next pipeline stage automatically (no-LLM mode).\n"
-                f"<ACTION>\ntool: run_pipeline_stage\nstage: {stage}\nparams: {{}}\n</ACTION>"
-            )
-    return (
-        "All pipeline stages are complete.\n"
-        "<ACTION>\ntool: show_state\nparams: {}\n</ACTION>"
+        messages=_to_claude_messages(history),
+        tools=TOOLS_ANTHROPIC,
     )
 
+    text = ""
+    tool_call = None
+    for block in response.content:
+        if block.type == "text":
+            text += block.text
+        elif block.type == "tool_use":
+            tool_call = {"id": block.id, "name": block.name, "input": block.input}
 
-def chat(messages: list[dict], system_prompt: str, settings: Settings) -> str:
-    """Send chat messages to configured backend with retries and return text output."""
+    return LLMResponse(text=text, tool_call=tool_call)
 
-    if settings.no_llm_mode:
-        return _next_incomplete_stage(system_prompt)
+
+def _call_openai_compatible(
+    history: list[dict],
+    system_prompt: str,
+    temperature: float,
+    base_url: str,
+    api_key: str,
+    model: str,
+) -> LLMResponse:
+    from openai import OpenAI
+
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Set it in .env or environment variables."
+        )
+
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=_to_openai_messages(history, system_prompt),
+        tools=tools_for_openai(),
+        tool_choice="auto",
+    )
+
+    message = response.choices[0].message
+    text = message.content or ""
+    tool_call = None
+    if message.tool_calls:
+        tc = message.tool_calls[0]
+        tool_call = {
+            "id": tc.id,
+            "name": tc.function.name,
+            "input": json.loads(tc.function.arguments),
+        }
+
+    return LLMResponse(text=text, tool_call=tool_call)
+
+
+def _parse_text_action(text: str) -> dict | None:
+    """Extract a tool call from a plain-text <ACTION> block (llama fallback only)."""
+    import re
+
+    match = re.search(r"<ACTION>(.*?)</ACTION>", text, flags=re.DOTALL)
+    if not match:
+        return None
+    action: dict = {}
+    for line in match.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key, value = key.strip(), value.strip()
+        if key == "params":
+            try:
+                action[key] = json.loads(value) if value else {}
+            except json.JSONDecodeError:
+                return None
+        else:
+            action[key] = value
+    tool_name = action.pop("tool", None)
+    if not tool_name:
+        return None
+    return {
+        "id": f"text-{hash(text) & 0xFFFFFF:06x}",
+        "name": tool_name,
+        "input": {k: v for k, v in action.items()},
+    }
+
+
+def _call_llama(
+    history: list[dict],
+    system_prompt: str,
+    temperature: float,
+    base_url: str,
+) -> LLMResponse:
+    from openai import OpenAI
+
+    client = OpenAI(base_url=base_url, api_key="none")
+    messages = _to_openai_messages(history, system_prompt)
+
+    # Try native function calling first.
+    try:
+        response = client.chat.completions.create(
+            model="local",
+            temperature=temperature,
+            messages=messages,
+            tools=tools_for_openai(),
+            tool_choice="auto",
+        )
+        message = response.choices[0].message
+        text = message.content or ""
+        tool_call = None
+        if message.tool_calls:
+            tc = message.tool_calls[0]
+            tool_call = {
+                "id": tc.id,
+                "name": tc.function.name,
+                "input": json.loads(tc.function.arguments),
+            }
+        return LLMResponse(text=text, tool_call=tool_call)
+    except Exception:  # noqa: BLE001
+        # Model does not support function calling — inject <ACTION> instructions
+        # and parse the text response.
+        fallback_system = system_prompt + _ACTION_FALLBACK_INSTRUCTIONS
+        fallback_messages = _to_openai_messages(history, fallback_system)
+        response = client.chat.completions.create(
+            model="local",
+            temperature=temperature,
+            messages=fallback_messages,
+        )
+        text = response.choices[0].message.content or ""
+        return LLMResponse(text=text, tool_call=_parse_text_action(text))
+
+
+# ---------------------------------------------------------------------------
+# Public interface
+# ---------------------------------------------------------------------------
+
+def chat(history: list[dict], system_prompt: str, settings: "Settings") -> LLMResponse:
+    """Send the conversation history to the configured LLM backend and return a structured response."""
 
     backend = settings.llm_backend
     console = Console()
     retries = [1, 2, 4]
-    prepared_messages = [{"role": "system", "content": system_prompt}] + [
-        {"role": m["role"], "content": m["content"]} for m in messages
-    ]
 
     for attempt, backoff in enumerate(retries, start=1):
         try:
             if backend == "claude":
                 return _call_claude(
-                    prepared_messages,
+                    history,
                     system_prompt,
                     temperature=0.2,
                     base_url=settings.anthropic_base_url,
@@ -128,14 +293,16 @@ def chat(messages: list[dict], system_prompt: str, settings: Settings) -> str:
                 )
             if backend == "openai":
                 return _call_openai_compatible(
-                    prepared_messages,
+                    history,
+                    system_prompt,
                     temperature=0.2,
                     base_url=settings.openai_api_url,
                     api_key=settings.openai_api_key,
                     model=settings.openai_model_id,
                 )
             return _call_llama(
-                prepared_messages,
+                history,
+                system_prompt,
                 temperature=0.2,
                 base_url=settings.llama_server_url,
             )

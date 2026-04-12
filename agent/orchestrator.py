@@ -5,7 +5,6 @@ from __future__ import annotations
 import datetime
 import json
 import os
-import re
 import uuid
 from pathlib import Path
 
@@ -88,7 +87,7 @@ class Orchestrator:
             "protein_assignment": ProteinAssignment(),
         }
         self.taxon_registry = TaxonRegistry()
-        self.history: list[dict[str, str]] = []
+        self.history: list[dict] = []
         self.latest_taxon_results: list[TaxonResult] = []
         self.latest_figures: list[str] = []
 
@@ -123,103 +122,51 @@ class Orchestrator:
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(f"\n{sep}\n[{ts}] {label}\n{sep}\n{content}\n")
 
-    _MAX_ACTION_RETRIES = 2
-
-    def _parse_action(self, response: str) -> dict | None:
-        """Extract and validate action dictionary from LLM ACTION block.
-
-        Returns None when:
-        - No <ACTION> block is present.
-        - The params value is not valid JSON.
-        - The required 'tool' field is absent.
-        """
-
-        match = re.search(r"<ACTION>(.*?)</ACTION>", response, flags=re.DOTALL)
-        if not match:
-            return None
-        block = match.group(1)
-        action: dict[str, object] = {}
-        for line in block.splitlines():
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if key == "params":
-                if not value:
-                    action[key] = {}
-                else:
-                    try:
-                        action[key] = json.loads(value)
-                    except json.JSONDecodeError as exc:
-                        self.console.print(
-                            f"[yellow]Warning: malformed params JSON in ACTION block: {exc}[/yellow]"
-                        )
-                        return None
-            else:
-                action[key] = value
-
-        if not action.get("tool"):
-            self.console.print("[yellow]Warning: ACTION block is missing the 'tool' field.[/yellow]")
-            return None
-
-        return action
-
-    def _request_action_repair(self, bad_response: str, attempt: int) -> str:
-        """Re-query the LLM with a targeted correction when the action block was invalid.
-
-        Injects a correction message into a *temporary* history copy so that
-        self.history is never polluted with the repair exchange.
-        """
-
-        raw_match = re.search(r"<ACTION>.*?</ACTION>", bad_response, flags=re.DOTALL)
-        raw_block = raw_match.group(0) if raw_match else "(no <ACTION> block found)"
-
-        correction = (
-            "Your previous response contained an invalid ACTION block that could not be "
-            "parsed:\n\n"
-            f"{raw_block}\n\n"
-            "Common causes:\n"
-            "  • params value is not valid JSON (use double-quoted keys, no trailing commas)\n"
-            "  • 'tool' field is missing\n\n"
-            "Please respond **only** with a corrected ACTION block using this exact format:\n\n"
-            "<ACTION>\n"
-            "tool: <run_pipeline_stage | run_taxon_inference | show_state | "
-            "generate_figures | export_report | ask_question>\n"
-            "stage: <stage_name>  (only required for run_pipeline_stage)\n"
-            'params: {"key": "value"}  (must be valid JSON; use {} if no params needed)\n'
-            "</ACTION>\n\n"
-            f"Repair attempt {attempt}/{self._MAX_ACTION_RETRIES}."
-        )
-
-        self._log_event(
-            f"TURN {self._turn} — ACTION REPAIR PROMPT (attempt {attempt}/{self._MAX_ACTION_RETRIES})",
-            correction,
-        )
-
-        repair_history = self.history + [{"role": "user", "content": correction}]
-        system_prompt = self._build_system_prompt()
-        return llm_client.chat(repair_history, system_prompt, self.settings)
-
-    def _approve_action(self, tool: str, stage: str | None, params: dict) -> tuple[bool, dict]:
-        """Apply autonomy mode gating and optionally allow param edits."""
+    def _approve_action(self, tool_name: str, tool_input: dict) -> tuple[bool, dict]:
+        """Apply autonomy mode gating and optionally allow full input edits."""
 
         mode = self.state.autonomy_mode
-        should_prompt = mode == "supervised" or (mode == "balanced" and tool == "run_pipeline_stage")
+        should_prompt = mode == "supervised" or (
+            mode == "balanced" and tool_name == "run_pipeline_stage"
+        )
         if not should_prompt:
-            return True, params
+            return True, tool_input
 
-        self.console.print(f"[cyan]Proposed action:[/cyan] tool={tool}, stage={stage}, params={params}")
+        self.console.print(
+            f"[cyan]Proposed tool call:[/cyan] {tool_name}({json.dumps(tool_input)})"
+        )
         answer = input("Proceed? (y/n/edit): ").strip().lower()
         if answer == "y":
-            return True, params
+            return True, tool_input
         if answer == "edit":
-            raw = input("Enter new params JSON: ").strip()
+            raw = input("Enter new tool input JSON: ").strip()
             try:
                 return True, json.loads(raw)
             except json.JSONDecodeError:
-                return False, params
-        return False, params
+                return False, tool_input
+        return False, tool_input
+
+    def _dispatch_tool(self, tool_name: str, tool_input: dict) -> dict:
+        """Execute a named tool with its input and return the result dict."""
+
+        if tool_name == "run_pipeline_stage":
+            return self.run_pipeline_stage(
+                str(tool_input.get("stage", "")),
+                tool_input.get("params") or {},
+            )
+        if tool_name == "run_taxon_inference":
+            algorithm = str(tool_input.get("algorithm", self.state.taxon_algorithm))
+            return self.run_taxon_inference(algorithm, tool_input)
+        if tool_name == "show_state":
+            return self.show_state()
+        if tool_name == "generate_figures":
+            return self.generate_figures(
+                list(tool_input.get("types", [])),
+                str(tool_input.get("data_path", "")),
+            )
+        if tool_name == "export_report":
+            return self.export_report(str(tool_input.get("format", "txt")))
+        return {"status": "error", "message": f"Unknown tool: {tool_name}"}
 
     def run_pipeline_stage(self, stage: str, params: dict) -> dict:
         """Execute a pipeline stage and update persisted state."""
@@ -458,34 +405,6 @@ class Orchestrator:
             self.console.print("[dim]  Going back to options...[/dim]\n")
             continue
 
-    def _execute_action(self, action: dict) -> dict:
-        """Dispatch action to tool method."""
-
-        tool = str(action.get("tool", ""))
-        stage = action.get("stage")
-        params = action.get("params", {})
-        if not isinstance(params, dict):
-            params = {}
-
-        # ask_question is user-facing by nature — skip the approval gate
-        if tool == "ask_question":
-            return self.ask_question(params)
-
-        approved, params = self._approve_action(tool, str(stage) if stage else None, params)
-        if not approved:
-            return {"status": "cancelled", "message": "Action cancelled by user."}
-
-        if tool == "run_pipeline_stage":
-            return self.run_pipeline_stage(str(stage), params)
-        if tool == "run_taxon_inference":
-            return self.run_taxon_inference(str(params.get("algorithm", self.state.taxon_algorithm)), params)
-        if tool == "show_state":
-            return self.show_state()
-        if tool == "generate_figures":
-            return self.generate_figures(list(params.get("types", [])), str(params.get("data_path", "")))
-        if tool == "export_report":
-            return self.export_report(str(params.get("format", "txt")))
-        return {"status": "error", "message": f"Unknown tool: {tool}"}
 
     # Ordered pipeline stages for no-LLM automatic execution.
     PIPELINE_STAGES = [
@@ -543,99 +462,88 @@ class Orchestrator:
                     break
 
     def run(self) -> None:
-        """Start interactive conversation loop and process LLM-directed actions."""
+        """Start interactive conversation loop and process LLM-directed tool calls."""
 
         if self.settings.no_llm_mode:
             self._run_no_llm()
             return
 
         self.console.print("[green]Type 'exit' or 'quit' to end the session.[/green]")
-        pending_input: str | None = None
         while True:
-            if pending_input is not None:
-                user_text = pending_input
-                pending_input = None
-            else:
-                user_text = input("> ").strip()
-                if user_text.lower() in {"exit", "quit"}:
-                    self.console.print("[green]Session ended.[/green]")
-                    break
+            # ── Outer loop: wait for user input ──────────────────────────────
+            user_text = input("> ").strip()
+            if user_text.lower() in {"exit", "quit"}:
+                self.console.print("[green]Session ended.[/green]")
+                break
 
             self._turn += 1
             self.history.append({"role": "user", "content": user_text})
             self._log_event(f"TURN {self._turn} — USER MESSAGE", user_text)
 
-            system_prompt = self._build_system_prompt()
-            self._log_event(f"TURN {self._turn} — SYSTEM PROMPT", system_prompt)
-            self._log_event(
-                f"TURN {self._turn} — CONVERSATION HISTORY (sent to LLM)",
-                json.dumps(self.history, indent=2, ensure_ascii=False),
-            )
-
-            response = llm_client.chat(self.history, system_prompt, self.settings)
-            self.console.print(Markdown(response))
-            self.history.append({"role": "assistant", "content": response})
-            self._log_event(f"TURN {self._turn} — LLM RESPONSE", response)
-
-            raw_action_match = re.search(r"<ACTION>.*?</ACTION>", response, flags=re.DOTALL)
-            if raw_action_match:
+            # ── Inner agentic loop: keep querying until no tool call ──────────
+            while True:
+                system_prompt = self._build_system_prompt()
+                self._log_event(f"TURN {self._turn} — SYSTEM PROMPT", system_prompt)
                 self._log_event(
-                    f"TURN {self._turn} — RAW ACTION BLOCK [PRE-EXECUTE]",
-                    raw_action_match.group(0),
+                    f"TURN {self._turn} — CONVERSATION HISTORY (sent to LLM)",
+                    json.dumps(self.history, indent=2, ensure_ascii=False),
                 )
 
-            action = self._parse_action(response)
+                response = llm_client.chat(self.history, system_prompt, self.settings)
 
-            # Fail-safe: model produced an action block but it was invalid → repair loop
-            if raw_action_match and action is None:
-                self.console.print(
-                    "[yellow]Invalid ACTION block detected — attempting repair...[/yellow]"
+                if response.text:
+                    self.console.print(Markdown(response.text))
+                    self._log_event(f"TURN {self._turn} — LLM RESPONSE (text)", response.text)
+
+                if response.tool_call is None:
+                    # Pure text reply — add to history and hand control back to user.
+                    if response.text:
+                        self.history.append({"role": "assistant", "content": response.text})
+                    break
+
+                tool_call = response.tool_call
+                tool_name = tool_call["name"]
+                tool_input = tool_call["input"]
+
+                self._log_event(
+                    f"TURN {self._turn} — TOOL CALL [PRE-EXECUTE]",
+                    json.dumps(tool_call, indent=2, ensure_ascii=False),
                 )
-                for attempt in range(1, self._MAX_ACTION_RETRIES + 1):
-                    repair_response = self._request_action_repair(response, attempt)
-                    self._log_event(
-                        f"TURN {self._turn} — ACTION REPAIR RESPONSE (attempt {attempt}/{self._MAX_ACTION_RETRIES})",
-                        repair_response,
-                    )
-                    raw_repair_match = re.search(r"<ACTION>.*?</ACTION>", repair_response, flags=re.DOTALL)
-                    if raw_repair_match:
-                        self._log_event(
-                            f"TURN {self._turn} — RAW ACTION BLOCK [REPAIR attempt {attempt}] [PRE-EXECUTE]",
-                            raw_repair_match.group(0),
-                        )
-                    action = self._parse_action(repair_response)
-                    if action:
-                        self.console.print(f"[green]Action repaired on attempt {attempt}.[/green]")
-                        break
+
+                # Record the assistant turn (text + tool_use) in history.
+                self.history.append(
+                    {"role": "assistant_with_tool", "text": response.text, "tool_call": tool_call}
+                )
+
+                # ask_question skips the approval gate — it *is* asking the user.
+                if tool_name == "ask_question":
+                    result = self.ask_question(tool_input)
                 else:
+                    approved, tool_input = self._approve_action(tool_name, tool_input)
+                    if not approved:
+                        result = {"status": "cancelled", "message": "Action cancelled by user."}
+                    else:
+                        result = self._dispatch_tool(tool_name, tool_input)
                     self.console.print(
-                        f"[red]Action repair failed after {self._MAX_ACTION_RETRIES} attempts — "
-                        "skipping action.[/red]"
+                        Panel(json.dumps(result, indent=2), title=f"Tool Result: {tool_name}")
                     )
-                    self._log_event(
-                        f"TURN {self._turn} — ACTION REPAIR FAILED",
-                        f"All {self._MAX_ACTION_RETRIES} repair attempts exhausted. Action skipped.",
-                    )
-
-            if action:
-                result = self._execute_action(action)
 
                 self._log_event(
-                    f"TURN {self._turn} — ACTION RESULT",
+                    f"TURN {self._turn} — TOOL RESULT",
                     json.dumps(result, indent=2, ensure_ascii=False),
                 )
 
-                # ask_question: feed the answer back to the LLM automatically
-                if action.get("tool") == "ask_question":
-                    if result.get("status") == "ok":
-                        pending_input = result["answer"]
-                        continue
-                    # cancelled — let the user type the next message
-                    self.console.print("[dim]Question cancelled.[/dim]")
-                    continue
+                # Append the tool result so the LLM sees it on the next inner iteration.
+                self.history.append(
+                    {
+                        "role": "tool_result",
+                        "tool_use_id": tool_call["id"],
+                        "content": json.dumps(result),
+                    }
+                )
 
-                tool_msg = f"Tool result: {json.dumps(result, indent=2)}"
-                self.console.print(Panel(tool_msg, title="Action Result"))
-                # Feed the result back as the next user message so the LLM
-                # automatically sees and reacts to it (including errors).
-                pending_input = tool_msg
+                # If ask_question was cancelled, stop the inner loop and let the user type.
+                if tool_name == "ask_question" and result.get("status") != "ok":
+                    self.console.print("[dim]Question cancelled.[/dim]")
+                    break
+                # Otherwise continue the inner loop — the LLM reacts to the result.
