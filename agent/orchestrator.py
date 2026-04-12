@@ -635,4 +635,6 @@ class Orchestrator:
 
                 tool_msg = f"Tool result: {json.dumps(result, indent=2)}"
                 self.console.print(Panel(tool_msg, title="Action Result"))
-                self.history.append({"role": "assistant", "content": tool_msg})
+                # Feed the result back as the next user message so the LLM
+                # automatically sees and reacts to it (including errors).
+                pending_input = tool_msg
