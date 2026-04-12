@@ -25,6 +25,7 @@ class Settings:
     anthropic_model_id: str = "claude-sonnet-4-6"
     msfragger_path: str = ""
     comet_path: str = ""
+    comet_params_path: str = ""
     tpp_bin_path: str = ""
     percolator_path: str = ""
     output_dir: str = "./output"
@@ -50,6 +51,7 @@ def load_settings() -> Settings:
         anthropic_model_id=os.getenv("ANTHROPIC_MODEL_ID", "claude-sonnet-4-6").strip(),
         msfragger_path=os.getenv("MSFRAGGER_PATH", "").strip(),
         comet_path=os.getenv("COMET_PATH", "").strip(),
+        comet_params_path=os.getenv("COMET_PARAMS_PATH", "").strip(),
         tpp_bin_path=os.getenv("TPP_BIN_PATH", "").strip(),
         percolator_path=os.getenv("PERCOLATOR_PATH", "").strip(),
         output_dir=os.getenv("OUTPUT_DIR", "./output").strip(),
