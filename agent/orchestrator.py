@@ -252,6 +252,7 @@ class Orchestrator:
             "database_path": self.state.database_path,
             "msfragger_path": self.settings.msfragger_path,
             "comet_path": self.settings.comet_path,
+            "comet_params_path": self.settings.comet_params_path,
             "tpp_bin_path": self.settings.tpp_bin_path,
             "percolator_path": self.settings.percolator_path,
         }
