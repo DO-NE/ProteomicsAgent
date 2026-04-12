@@ -283,6 +283,103 @@ class Orchestrator:
         path = export_summary(self.state, self.latest_taxon_results, self.latest_figures, report_dir)
         return {"status": "ok", "path": path}
 
+    _OTHER_SENTINEL = "__other__"
+
+    def ask_question(self, params: dict) -> dict:
+        """Present an interactive question with arrow-key navigation."""
+
+        import questionary
+        from questionary import Choice, Style
+
+        question = str(params.get("question", "What would you like to do?"))
+        q_type = str(params.get("type", "decision"))
+        options = params.get("options", [])
+        if not isinstance(options, list):
+            options = []
+
+        type_labels = {
+            "clarification": "Clarification Needed",
+            "decision": "Decision",
+            "parameter": "Parameter Input",
+        }
+        type_label = type_labels.get(q_type, q_type.title())
+
+        style = Style([
+            ("qmark", "fg:cyan bold"),
+            ("question", "bold"),
+            ("answer", "fg:green bold"),
+            ("pointer", "fg:cyan bold"),
+            ("highlighted", "fg:cyan bold"),
+            ("selected", "fg:green"),
+        ])
+
+        # Build questionary choices
+        choices: list[Choice] = []
+        for opt in options:
+            if isinstance(opt, str):
+                label, desc = opt, ""
+            else:
+                label = opt.get("label", "")
+                desc = opt.get("description", "")
+            title = f"{label} — {desc}" if desc else label
+            choices.append(Choice(title=title, value=label))
+        choices.append(Choice(
+            title="Other (type your own response)",
+            value=self._OTHER_SENTINEL,
+        ))
+
+        # Show context panel
+        self.console.print(Panel(
+            f"[bold]{question}[/bold]",
+            title=type_label,
+            border_style="cyan",
+        ))
+
+        # Selection loop — user can go back from "Other" to the option list
+        while True:
+            selected = questionary.select(
+                "Select an option:",
+                choices=choices,
+                style=style,
+                instruction="(arrow keys to move, enter to select)",
+            ).ask()
+
+            if selected is None:
+                # User pressed Ctrl-C — treat as cancel
+                return {"status": "cancelled", "message": "Question cancelled by user."}
+
+            if selected != self._OTHER_SENTINEL:
+                self.console.print(f"\n  [green]Selected:[/green] {selected}\n")
+                return {"status": "ok", "answer": selected, "type": q_type}
+
+            # "Other" selected — prompt for free text
+            custom = questionary.text(
+                "Your response:",
+                style=style,
+            ).ask()
+
+            if custom is None or not custom.strip():
+                # Ctrl-C or empty — go back to option list
+                self.console.print("[dim]  Going back to options...[/dim]\n")
+                continue
+
+            custom = custom.strip()
+
+            # Confirm or go back
+            confirm = questionary.confirm(
+                f'Send "{custom}"?',
+                default=True,
+                style=style,
+            ).ask()
+
+            if confirm:
+                self.console.print(f"\n  [green]Selected:[/green] {custom}\n")
+                return {"status": "ok", "answer": custom, "type": q_type}
+
+            # User declined — back to option list
+            self.console.print("[dim]  Going back to options...[/dim]\n")
+            continue
+
     def _execute_action(self, action: dict) -> dict:
         """Dispatch action to tool method."""
 
@@ -296,6 +393,8 @@ class Orchestrator:
         if not approved:
             return {"status": "cancelled", "message": "Action cancelled by user."}
 
+        if tool == "ask_question":
+            return self.ask_question(params)
         if tool == "run_pipeline_stage":
             return self.run_pipeline_stage(str(stage), params)
         if tool == "run_taxon_inference":
@@ -371,11 +470,16 @@ class Orchestrator:
             return
 
         self.console.print("[green]Type 'exit' or 'quit' to end the session.[/green]")
+        pending_input: str | None = None
         while True:
-            user_text = input("> ").strip()
-            if user_text.lower() in {"exit", "quit"}:
-                self.console.print("[green]Session ended.[/green]")
-                break
+            if pending_input is not None:
+                user_text = pending_input
+                pending_input = None
+            else:
+                user_text = input("> ").strip()
+                if user_text.lower() in {"exit", "quit"}:
+                    self.console.print("[green]Session ended.[/green]")
+                    break
 
             self.history.append({"role": "user", "content": user_text})
             system_prompt = self._build_system_prompt()
@@ -386,6 +490,17 @@ class Orchestrator:
             action = self._parse_action(response)
             if action:
                 result = self._execute_action(action)
+
+                # ask_question: feed the answer back to the LLM automatically
+                if action.get("tool") == "ask_question" and result.get("status") == "ok":
+                    answer = result["answer"]
+                    self.history.append({
+                        "role": "assistant",
+                        "content": f"User selected: {answer}",
+                    })
+                    pending_input = answer
+                    continue
+
                 tool_msg = f"Tool result: {json.dumps(result, indent=2)}"
                 self.console.print(Panel(tool_msg, title="Action Result"))
                 self.history.append({"role": "assistant", "content": tool_msg})
