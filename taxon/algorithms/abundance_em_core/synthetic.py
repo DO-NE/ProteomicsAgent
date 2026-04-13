@@ -18,6 +18,8 @@ def generate_synthetic_community(
     true_pi: Optional[np.ndarray] = None,
     total_psms: int = 10000,
     seed: int = 42,
+    detectability: Optional[str] = None,
+    detectability_shape: float = 0.5,
 ) -> dict:
     """Generate a synthetic metaproteomics community with known ground truth.
 
@@ -45,12 +47,24 @@ def generate_synthetic_community(
         ``10000``).
     seed : int, optional
         Random seed (default ``42``).
+    detectability : {None, "lognormal", "gamma"}, optional
+        Distribution for generating non-uniform per-peptide detectability
+        weights.  ``None`` (default) gives uniform weights (all 1.0).
+        ``"lognormal"`` draws weights from LogNormal(0, detectability_shape).
+        ``"gamma"`` draws from Gamma(detectability_shape, 1).
+    detectability_shape : float, optional
+        Shape parameter controlling the spread of detectability weights
+        (default ``0.5``).  Larger values = more spread = more non-uniformity.
+        For lognormal, this is the standard deviation of the log.
+        For gamma, this is the shape parameter.
 
     Returns
     -------
     dict
         Keys: ``A``, ``y``, ``true_pi``, ``peptide_names``, ``taxon_names``,
-        ``phi``.
+        ``phi``, ``detectability_weights``.  The ``detectability_weights``
+        key contains the per-peptide weight vector (all ones when
+        ``detectability=None``).
 
     Notes
     -----
@@ -96,13 +110,25 @@ def generate_synthetic_community(
             extra = int(rng.choice(choices))
             A[p, extra] = 1
 
+    # Step 3: generate detectability weights.
+    if detectability is None:
+        d = np.ones(P, dtype=np.float64)
+    elif detectability == "lognormal":
+        d = rng.lognormal(mean=0.0, sigma=detectability_shape, size=P)
+    elif detectability == "gamma":
+        d = rng.gamma(shape=detectability_shape, scale=1.0, size=P)
+    else:
+        raise ValueError(
+            f"detectability must be None, 'lognormal', or 'gamma', "
+            f"got {detectability!r}"
+        )
+
     # Step 4: simulate spectral counts y ~ Multinomial(N, phi(true_pi))
-    n_t = A.sum(axis=0).astype(np.float64)
-    if (n_t == 0).any():
-        # Should not occur because each taxon receives n_peptides_per_taxon
-        # private peptides, but guard anyway.
-        raise RuntimeError("internal: a synthetic taxon has zero peptides")
-    M = A.astype(np.float64) / n_t[np.newaxis, :]
+    # using the weighted emission matrix.
+    from .detectability import build_weighted_emission_matrix
+
+    A_float = A.astype(np.float64)
+    M = build_weighted_emission_matrix(A_float, d)
     phi = M @ true_pi
     phi = phi / phi.sum()  # numerical safety
     y = rng.multinomial(total_psms, phi)
@@ -117,6 +143,7 @@ def generate_synthetic_community(
         "peptide_names": peptide_names,
         "taxon_names": taxon_names,
         "phi": phi,
+        "detectability_weights": d,
     }
 
 

@@ -1,17 +1,16 @@
 """Multinomial-mixture EM (MAP) for taxon abundance estimation.
 
 The model treats observed peptide spectral counts as draws from a mixture of
-taxon-specific peptide emission distributions, where each taxon emits its
-member peptides with equal probability (uniform-emission baseline). Inference
-is performed by Expectation-Maximization on the log-posterior with a sparse
-Dirichlet prior.
+taxon-specific peptide emission distributions. Inference is performed by
+Expectation-Maximization on the log-posterior with a sparse Dirichlet prior.
 
 Generative model
 ----------------
 - A in {0, 1}^{P x T} : peptide-to-taxon mapping (1 if taxon t can produce
   peptide p).
-- n_t = sum_p A_{pt} : repertoire size of taxon t.
-- M_{pt} = A_{pt} / n_t : per-taxon peptide emission probability.
+- d in R_+^P : per-peptide detectability weights (default all-ones = uniform).
+- M_{pt} = (A_{pt} * d_p) / sum_{p'} (A_{p't} * d_{p'}) : weighted emission.
+  When d = 1, this reduces to the uniform baseline A_{pt} / n_t.
 - pi in simplex^{T-1} : taxon abundance vector (the inference target).
 - phi_p(pi) = sum_t pi_t * M_{pt} : marginal probability of peptide p.
 - y ~ Multinomial(N, phi(pi)).
@@ -58,6 +57,11 @@ class _FitState:
 
 class AbundanceEM:
     """Multinomial-mixture EM for taxon abundance estimation.
+
+    Supports optional per-peptide detectability weights that correct the
+    emission probabilities for non-uniform peptide observability.  When
+    weights are provided, the emission matrix becomes
+    ``M_{pt} = (A_{pt} * d_p) / sum_{p'} (A_{p't} * d_{p'})``.
 
     Parameters
     ----------
@@ -146,10 +150,16 @@ class AbundanceEM:
         self._M: Optional[np.ndarray] = None
         self._y: Optional[np.ndarray] = None
         self._taxon_names: Optional[list] = None
+        self._detectability_weights: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ public
 
-    def fit(self, A: np.ndarray, y: np.ndarray) -> "AbundanceEM":
+    def fit(
+        self,
+        A: np.ndarray,
+        y: np.ndarray,
+        detectability_weights: Optional[np.ndarray] = None,
+    ) -> "AbundanceEM":
         """Fit the model.
 
         Parameters
@@ -160,6 +170,12 @@ class AbundanceEM:
             comparing to zero.
         y : np.ndarray, shape ``(P,)``
             Spectral count vector (non-negative).
+        detectability_weights : np.ndarray or None, shape ``(P,)``
+            Per-peptide detectability weights.  When provided, the emission
+            matrix is computed as
+            ``M_{pt} = (A_{pt} * d_p) / sum_{p'} (A_{p't} * d_{p'})``
+            instead of the uniform ``A_{pt} / n_t``.  Pass ``None`` (default)
+            for the original uniform-emission model.
 
         Returns
         -------
@@ -185,26 +201,26 @@ class AbundanceEM:
         if T == 0:
             raise ValueError("A must have at least one taxon column")
 
+        # Validate detectability weights if provided.
+        if detectability_weights is not None:
+            detectability_weights = np.asarray(
+                detectability_weights, dtype=np.float64
+            )
+            if detectability_weights.shape != (P,):
+                raise ValueError(
+                    f"detectability_weights must have shape ({P},), "
+                    f"got {detectability_weights.shape}"
+                )
+            if (detectability_weights < 0).any():
+                raise ValueError("detectability_weights must be non-negative")
+
         # Coerce to binary float matrix once.
         A_bin = (A_arr != 0).astype(np.float64)
-        n_t = A_bin.sum(axis=0)  # repertoire sizes
 
-        if (n_t == 0).any():
-            empty = np.where(n_t == 0)[0].tolist()
-            logger.warning(
-                "Dropping %d taxon column(s) with empty peptide repertoire: %s",
-                len(empty),
-                empty,
-            )
-        # Replace zero repertoires with 1 so M is well-defined; the
-        # corresponding column of M is identically zero, so these taxa never
-        # collect responsibility and the M-step pushes them to the prior.
-        n_t_safe = np.where(n_t == 0, 1.0, n_t)
-        M = A_bin / n_t_safe[np.newaxis, :]
-        # Force the original empty columns of M back to zero so they cannot
-        # collect any peptide responsibility.
-        if (n_t == 0).any():
-            M[:, n_t == 0] = 0.0
+        # Build emission matrix M, optionally weighted by detectability.
+        from .detectability import build_weighted_emission_matrix
+
+        M = build_weighted_emission_matrix(A_bin, detectability_weights)
 
         # Edge case: T == 1 forces pi = [1.0]; skip EM entirely.
         if T == 1:
@@ -215,6 +231,7 @@ class AbundanceEM:
             self._A = A_bin
             self._M = M
             self._y = y_arr
+            self._detectability_weights = detectability_weights
             self.pi_ = pi
             self.responsibilities_ = responsibilities
             self.log_posterior_history_ = [self._log_posterior(pi, M, y_arr)]
@@ -262,6 +279,7 @@ class AbundanceEM:
         self._A = A_bin
         self._M = M
         self._y = y_arr
+        self._detectability_weights = detectability_weights
         self.pi_ = pi
         self.responsibilities_ = responsibilities
         self.log_posterior_history_ = best.log_posterior_history
