@@ -25,6 +25,7 @@ from taxon.algorithms.abundance_em_core.model import AbundanceEM
 from taxon.algorithms.abundance_em_core.pepxml_parser import parse_pepxml
 from taxon.algorithms.abundance_em_core.synthetic import (
     evaluate_recovery,
+    generate_detectability_test,
     generate_synthetic_community,
 )
 
@@ -235,6 +236,73 @@ def test_reproducibility_with_seed():
 
     np.testing.assert_allclose(m1.pi_, m2.pi_, atol=1e-12)
     assert m1.n_iter_ == m2.n_iter_
+
+
+def test_detectability_correction():
+    """Detectability-corrected EM should recover better than uniform on
+    data generated with non-uniform emission."""
+    data = generate_detectability_test(
+        n_taxa=3,
+        n_peptides_per_taxon=100,
+        shared_fraction=0.10,
+        total_psms=10000,
+        seed=42,
+    )
+
+    # With detectability correction (inject true weights).
+    model_corrected = AbundanceEM(
+        alpha=0.5, max_iter=500, tol=1e-8, seed=0,
+        detectability_weights=data["detectability_weights"],
+    )
+    model_corrected.fit(data["A"], data["y"])
+
+    # Without correction (uniform emission).
+    model_uniform = AbundanceEM(
+        alpha=0.5, max_iter=500, tol=1e-8, seed=0,
+        detectability_mode="uniform",
+    )
+    model_uniform.fit(data["A"], data["y"])
+
+    metrics_corrected = evaluate_recovery(data["true_pi"], model_corrected.pi_)
+    metrics_uniform = evaluate_recovery(data["true_pi"], model_uniform.pi_)
+
+    # Corrected model should have strictly lower L1 error.
+    assert metrics_corrected["l1_error"] < metrics_uniform["l1_error"], (
+        f"corrected L1={metrics_corrected['l1_error']:.4f} should be < "
+        f"uniform L1={metrics_uniform['l1_error']:.4f}"
+    )
+    # Corrected model should achieve reasonable recovery.
+    assert metrics_corrected["l1_error"] < 0.05, (
+        f"corrected L1 error too large: {metrics_corrected['l1_error']:.4f}"
+    )
+    # Both models should converge.
+    assert model_corrected.converged_
+    assert model_uniform.converged_
+
+
+def test_detectability_uniform_backward_compat():
+    """detectability_mode='uniform' must reproduce the original model exactly."""
+    data = generate_synthetic_community(
+        n_taxa=5,
+        n_peptides_per_taxon=200,
+        shared_fraction=0.15,
+        total_psms=15000,
+        seed=11,
+    )
+
+    # Original model (no detectability params).
+    model_orig = AbundanceEM(alpha=0.5, max_iter=500, tol=1e-7, seed=0)
+    model_orig.fit(data["A"], data["y"])
+
+    # Explicitly uniform.
+    model_uniform = AbundanceEM(
+        alpha=0.5, max_iter=500, tol=1e-7, seed=0,
+        detectability_mode="uniform",
+    )
+    model_uniform.fit(data["A"], data["y"])
+
+    np.testing.assert_allclose(model_orig.pi_, model_uniform.pi_, atol=1e-12)
+    assert model_orig.n_iter_ == model_uniform.n_iter_
 
 
 # ------------------------------------------------------------------- header parsing

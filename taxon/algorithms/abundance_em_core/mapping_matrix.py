@@ -246,6 +246,60 @@ def build_mapping_matrix(
     return A, peptide_list, taxon_labels
 
 
+def apply_detectability_weights(
+    A: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    """Build a detectability-weighted emission matrix from a mapping matrix.
+
+    Computes ``W`` where ``W_{pt} = d_p * A_{pt} / sum_{p'}(d_{p'} * A_{p't})``,
+    i.e. the mapping matrix element-wise scaled by per-peptide detectability
+    scores and then column-normalised per taxon.
+
+    Parameters
+    ----------
+    A : np.ndarray or scipy.sparse matrix, shape ``(P, T)``
+        Peptide-to-taxon mapping matrix (binary or float).  Sparse matrices
+        are converted to dense internally.
+    weights : np.ndarray, shape ``(P,)``
+        Per-peptide detectability scores ``d_p``.
+
+    Returns
+    -------
+    W : np.ndarray, shape ``(P, T)``
+        Column-normalised weighted emission matrix.  The original ``A`` is
+        not modified.
+
+    Raises
+    ------
+    ValueError
+        If the length of *weights* does not match the row dimension of *A*.
+    """
+    from scipy.sparse import issparse
+
+    A_arr = A.toarray().astype(np.float64) if issparse(A) else np.asarray(A, dtype=np.float64)
+    d = np.asarray(weights, dtype=np.float64)
+
+    if d.shape[0] != A_arr.shape[0]:
+        raise ValueError(
+            f"weights length ({d.shape[0]}) must match number of peptides "
+            f"({A_arr.shape[0]})"
+        )
+
+    # Element-wise weight: dA_{pt} = d_p * A_{pt}
+    dA = A_arr * d[:, np.newaxis]
+
+    # Column-normalise per taxon.
+    col_sums = dA.sum(axis=0)
+    col_sums_safe = np.where(col_sums == 0, 1.0, col_sums)
+    W = dA / col_sums_safe[np.newaxis, :]
+
+    # Force empty-taxon columns back to zero.
+    W[:, col_sums == 0] = 0.0
+
+    return W
+
+
 # --------------------------------------------------------------------- helpers
 
 

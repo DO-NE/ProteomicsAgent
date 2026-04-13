@@ -65,6 +65,14 @@ class AbundanceEMPlugin(TaxonPlugin):
         a count of 1.
     seed : int
         RNG seed for reproducibility (default unset).
+    detectability_mode : str
+        Peptide detectability weighting mode (default ``"uniform"``).
+        Options: ``"uniform"`` (legacy, no weighting),
+        ``"sequence_features"`` (physicochemical prediction),
+        ``"file"`` (load from TSV).
+    detectability_file : str
+        Path to a TSV with pre-computed detectability scores.
+        Required when ``detectability_mode="file"``.
     """
 
     name = "abundance_em"
@@ -114,6 +122,8 @@ class AbundanceEMPlugin(TaxonPlugin):
         max_length = int(config.get("max_peptide_length", 50))
         run_id_check = bool(config.get("run_identifiability", True))
         seed = config.get("seed")
+        detectability_mode = str(config.get("detectability_mode", "uniform"))
+        detectability_file = config.get("detectability_file")
 
         # When a pepXML is available, derive peptides and spectral counts
         # from the PSM-level data instead of the caller-supplied protein list.
@@ -173,8 +183,10 @@ class AbundanceEMPlugin(TaxonPlugin):
             n_restarts=n_restarts,
             min_abundance=min_abundance,
             seed=seed,
+            detectability_mode=detectability_mode,
+            detectability_file=detectability_file,
         )
-        model.fit(A, y)
+        model.fit(A, y, peptide_sequences=peptide_list)
         logger.info(
             "AbundanceEM converged=%s in %d iterations (final lp=%.4f)",
             model.converged_,
