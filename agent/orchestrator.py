@@ -239,6 +239,11 @@ class Orchestrator:
         detectability_file = params.get("detectability_file") or os.getenv("TAXON_DETECTABILITY_FILE")
         if detectability_file:
             config["detectability_file"] = detectability_file
+        resolve_uniprot_env = os.getenv("TAXON_RESOLVE_UNIPROT")
+        if "resolve_uniprot" in params:
+            config["resolve_uniprot"] = bool(params["resolve_uniprot"])
+        elif resolve_uniprot_env is not None:
+            config["resolve_uniprot"] = resolve_uniprot_env.lower() not in ("0", "false", "no")
 
         results = self.taxon_registry.run(algorithm, peptides, config)
         self.latest_taxon_results = results

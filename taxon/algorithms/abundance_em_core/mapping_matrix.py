@@ -18,6 +18,11 @@ from typing import Iterator, Optional
 import numpy as np
 from scipy.sparse import csc_matrix
 
+from .accession_resolver import (
+    extract_uniprot_accession,
+    resolve_accessions,
+)
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -44,6 +49,7 @@ def build_mapping_matrix(
     max_length: int = 50,
     exclude_prefixes: list | None = None,
     pepxml_protein_map: dict | None = None,
+    resolve_uniprot: bool = False,
 ) -> tuple:
     """Build a peptide-taxon mapping matrix from a FASTA database.
 
@@ -115,18 +121,70 @@ def build_mapping_matrix(
     taxon_buckets: dict = {}
     protein_taxon: dict = {}  # accession -> taxon_key (for substring matching)
     protein_seqs: dict = {}   # accession -> sequence (for substring matching)
+
+    # First pass: parse every header so we can optionally look up organisms
+    # for bare UniProt-accession headers before building the taxon buckets.
+    parsed_records: list = []  # (accession, uniprot_acc, initial_key, seq)
+    known_acc_organism: dict = {}  # UniProt accession -> organism (from fasta)
+    organism_to_taxid: dict = {}   # organism name -> taxon_id (from fasta)
+    unresolved_uniprot: set = set()
+    total_proteins = 0
+    classified_by_header = 0
+    unclassified_initial = 0
     for header, seq in _iter_fasta(fasta):
         if _should_exclude(header, exclude_prefixes):
             continue
+        total_proteins += 1
         accession = _extract_accession(header)
-        taxon_id, taxon_name = _parse_header(header)
-        key = (taxon_id, taxon_name)
-        if key not in taxon_buckets:
-            taxon_buckets[key] = []
-        taxon_buckets[key].append(seq)
+        uniprot_acc = extract_uniprot_accession(accession)
+        key = _parse_header(header)
+        if key == ("0", "unclassified"):
+            unclassified_initial += 1
+            if resolve_uniprot and uniprot_acc:
+                unresolved_uniprot.add(uniprot_acc)
+        else:
+            classified_by_header += 1
+            if uniprot_acc and uniprot_acc not in known_acc_organism:
+                known_acc_organism[uniprot_acc] = key[1]
+            # Prefer a numeric OX-derived id over a slug for the same name.
+            existing = organism_to_taxid.get(key[1])
+            if existing is None or (not existing.isdigit() and key[0].isdigit()):
+                organism_to_taxid[key[1]] = key[0]
+        parsed_records.append((accession, uniprot_acc, key, seq))
+
+    # Phase 1 + 2 resolution for bare UniProt accessions.
+    acc_to_organism: dict = {}
+    if resolve_uniprot and unresolved_uniprot:
+        acc_to_organism = resolve_accessions(
+            fasta_path=fasta_path,
+            unresolved_accessions=unresolved_uniprot,
+            known_accession_organism=known_acc_organism,
+            use_api=True,
+        )
+
+    resolved_via_lookup = 0
+    for accession, uniprot_acc, key, seq in parsed_records:
+        if key == ("0", "unclassified") and uniprot_acc:
+            organism = acc_to_organism.get(uniprot_acc)
+            if organism:
+                taxid = organism_to_taxid.get(organism) or _slug(organism)
+                key = (taxid, organism)
+                resolved_via_lookup += 1
+        taxon_buckets.setdefault(key, []).append(seq)
         protein_taxon[accession] = key
         if pepxml_protein_map is not None:
             protein_seqs[accession] = seq
+
+    if resolve_uniprot and unresolved_uniprot:
+        remaining_unclassified = unclassified_initial - resolved_via_lookup
+        logger.info(
+            "Accession resolution summary: total=%d, classified_by_header=%d, "
+            "resolved_by_lookup=%d, remaining_unclassified=%d",
+            total_proteins,
+            classified_by_header,
+            resolved_via_lookup,
+            remaining_unclassified,
+        )
 
     if not taxon_buckets:
         logger.warning("FASTA file %s yielded no parseable records", fasta_path)

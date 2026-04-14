@@ -73,6 +73,11 @@ class AbundanceEMPlugin(TaxonPlugin):
     detectability_file : str
         Path to a TSV with pre-computed detectability scores.
         Required when ``detectability_mode="file"``.
+    resolve_uniprot : bool
+        When ``True`` (default) the FASTA is pre-scanned to resolve bare
+        UniProt accession headers (e.g. ``>Q2FYC6``) to their source
+        organism via a cached UniProt REST lookup, preventing those
+        proteins from being bucketed as ``unclassified``.
     """
 
     name = "abundance_em"
@@ -124,6 +129,7 @@ class AbundanceEMPlugin(TaxonPlugin):
         seed = config.get("seed")
         detectability_mode = str(config.get("detectability_mode", "uniform"))
         detectability_file = config.get("detectability_file")
+        resolve_uniprot = bool(config.get("resolve_uniprot", True))
 
         # When a pepXML is available, derive peptides and spectral counts
         # from the PSM-level data instead of the caller-supplied protein list.
@@ -152,6 +158,7 @@ class AbundanceEMPlugin(TaxonPlugin):
             max_length=max_length,
             exclude_prefixes=exclude_prefixes,
             pepxml_protein_map=pepxml_protein_map,
+            resolve_uniprot=resolve_uniprot,
         )
         if A.shape[1] == 0:
             logger.warning(

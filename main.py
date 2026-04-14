@@ -104,6 +104,11 @@ def cli() -> None:
     default=None,
     help="TSV with pre-computed detectability scores (required when --detectability-mode=file).",
 )
+@click.option(
+    "--resolve-uniprot/--no-resolve-uniprot",
+    default=None,
+    help="Resolve bare UniProt accession FASTA headers via the UniProt REST API (default: on).",
+)
 def run_cmd(
     input_path: Path,
     database_path: Path,
@@ -111,6 +116,7 @@ def run_cmd(
     no_llm: bool,
     detectability_mode: str | None,
     detectability_file: Path | None,
+    resolve_uniprot: bool | None,
 ) -> None:
     """Start a new run or resume latest if user confirms."""
 
@@ -123,6 +129,8 @@ def run_cmd(
     if detectability_mode == "file" and not detectability_file:
         console.print(Panel("--detectability-file is required when --detectability-mode=file.", style="red"))
         raise SystemExit(1)
+    if resolve_uniprot is not None:
+        os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
@@ -234,11 +242,17 @@ def start_server_cmd() -> None:
     default=None,
     help="TSV with pre-computed detectability scores (required when --detectability-mode=file).",
 )
+@click.option(
+    "--resolve-uniprot/--no-resolve-uniprot",
+    default=None,
+    help="Resolve bare UniProt accession FASTA headers via the UniProt REST API (default: on).",
+)
 def run_pipeline_cmd(
     input_path: Path,
     database_path: Path,
     detectability_mode: str | None,
     detectability_file: Path | None,
+    resolve_uniprot: bool | None,
 ) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
@@ -250,6 +264,8 @@ def run_pipeline_cmd(
     if detectability_mode == "file" and not detectability_file:
         console.print(Panel("--detectability-file is required when --detectability-mode=file.", style="red"))
         raise SystemExit(1)
+    if resolve_uniprot is not None:
+        os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
