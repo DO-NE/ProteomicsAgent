@@ -233,6 +233,13 @@ class Orchestrator:
             "spectral_counts": spectral_counts,
         }
 
+        detectability_mode = params.get("detectability_mode") or os.getenv("TAXON_DETECTABILITY_MODE")
+        if detectability_mode:
+            config["detectability_mode"] = detectability_mode
+        detectability_file = params.get("detectability_file") or os.getenv("TAXON_DETECTABILITY_FILE")
+        if detectability_file:
+            config["detectability_file"] = detectability_file
+
         results = self.taxon_registry.run(algorithm, peptides, config)
         self.latest_taxon_results = results
         self.state.taxon_algorithm = algorithm
