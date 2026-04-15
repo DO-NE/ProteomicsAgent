@@ -31,6 +31,14 @@ class AbundanceEMPlugin(TaxonPlugin):
 
     Optional config keys
     --------------------
+    pepxml_path : str
+        Path to a validated pepXML file.  When provided the plugin extracts
+        peptide-level spectral counts and protein mappings directly from the
+        pepXML, overriding both the *peptides* argument and any
+        ``spectral_counts`` dict in the config.
+    exclude_prefixes : list[str]
+        Protein-accession prefixes to exclude during both pepXML parsing and
+        FASTA parsing (default ``["DECOY", "contag"]``).
     alpha : float
         Dirichlet prior hyperparameter (default ``0.5``, sparsity-inducing).
     max_iter : int
@@ -52,10 +60,24 @@ class AbundanceEMPlugin(TaxonPlugin):
         Whether to run the identifiability report and log warnings
         (default ``True``).
     spectral_counts : dict[str, int]
-        Optional mapping ``peptide_sequence -> count``. If absent, every
-        observed peptide is given a count of 1.
+        Optional mapping ``peptide_sequence -> count``. Ignored when
+        ``pepxml_path`` is set. If absent, every observed peptide is given
+        a count of 1.
     seed : int
         RNG seed for reproducibility (default unset).
+    detectability_mode : str
+        Peptide detectability weighting mode (default ``"uniform"``).
+        Options: ``"uniform"`` (legacy, no weighting),
+        ``"sequence_features"`` (physicochemical prediction),
+        ``"file"`` (load from TSV).
+    detectability_file : str
+        Path to a TSV with pre-computed detectability scores.
+        Required when ``detectability_mode="file"``.
+    resolve_uniprot : bool
+        When ``True`` (default) the FASTA is pre-scanned to resolve bare
+        UniProt accession headers (e.g. ``>Q2FYC6``) to their source
+        organism via a cached UniProt REST lookup, preventing those
+        proteins from being bucketed as ``unclassified``.
     """
 
     name = "abundance_em"
@@ -69,12 +91,16 @@ class AbundanceEMPlugin(TaxonPlugin):
     # ----------------------------------------------------------------- API
 
     def validate_config(self, config: dict) -> bool:
-        """Check that ``fasta_path`` is set and points at an existing file."""
+        """Check that ``fasta_path`` (and optionally ``pepxml_path``) exist."""
         fasta_path = config.get("fasta_path")
         if not fasta_path:
             return False
-        path = Path(str(fasta_path))
-        return path.exists() and path.is_file()
+        if not Path(str(fasta_path)).is_file():
+            return False
+        pepxml_path = config.get("pepxml_path")
+        if pepxml_path and not Path(str(pepxml_path)).is_file():
+            return False
+        return True
 
     def run(self, peptides: list, config: dict) -> list:
         """Run abundance estimation and return TaxonResult records.
@@ -85,12 +111,9 @@ class AbundanceEMPlugin(TaxonPlugin):
             Sorted by abundance descending. Only taxa with abundance strictly
             greater than ``min_abundance`` are included.
         """
-        if not peptides:
-            logger.warning("AbundanceEMPlugin: empty peptide list, returning []")
-            return []
-
         fasta_path = str(config["fasta_path"])
-        spectral_counts = config.get("spectral_counts") or {}
+        pepxml_path = config.get("pepxml_path")
+        exclude_prefixes = config.get("exclude_prefixes", ["DECOY", "contag"])
 
         # Plugin parameters with defaults.
         alpha = float(config.get("alpha", 0.5))
@@ -104,6 +127,26 @@ class AbundanceEMPlugin(TaxonPlugin):
         max_length = int(config.get("max_peptide_length", 50))
         run_id_check = bool(config.get("run_identifiability", True))
         seed = config.get("seed")
+        detectability_mode = str(config.get("detectability_mode", "uniform"))
+        detectability_file = config.get("detectability_file")
+        resolve_uniprot = bool(config.get("resolve_uniprot", True))
+
+        # When a pepXML is available, derive peptides and spectral counts
+        # from the PSM-level data instead of the caller-supplied protein list.
+        pepxml_protein_map = None
+        if pepxml_path:
+            from .abundance_em_core.pepxml_parser import parse_pepxml
+
+            spectral_counts, pepxml_protein_map = parse_pepxml(
+                pepxml_path, exclude_prefixes=exclude_prefixes,
+            )
+            peptides = list(spectral_counts.keys())
+        else:
+            spectral_counts = config.get("spectral_counts") or {}
+
+        if not peptides:
+            logger.warning("AbundanceEMPlugin: empty peptide list, returning []")
+            return []
 
         # Build the mapping matrix.
         A, peptide_list, taxon_labels = build_mapping_matrix(
@@ -113,6 +156,9 @@ class AbundanceEMPlugin(TaxonPlugin):
             missed_cleavages=missed_cleavages,
             min_length=min_length,
             max_length=max_length,
+            exclude_prefixes=exclude_prefixes,
+            pepxml_protein_map=pepxml_protein_map,
+            resolve_uniprot=resolve_uniprot,
         )
         if A.shape[1] == 0:
             logger.warning(
@@ -144,8 +190,10 @@ class AbundanceEMPlugin(TaxonPlugin):
             n_restarts=n_restarts,
             min_abundance=min_abundance,
             seed=seed,
+            detectability_mode=detectability_mode,
+            detectability_file=detectability_file,
         )
-        model.fit(A, y)
+        model.fit(A, y, peptide_sequences=peptide_list)
         logger.info(
             "AbundanceEM converged=%s in %d iterations (final lp=%.4f)",
             model.converged_,

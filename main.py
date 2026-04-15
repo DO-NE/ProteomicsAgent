@@ -92,11 +92,45 @@ def cli() -> None:
 @click.option("--db", "database_path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--autonomy", type=click.Choice(["full", "balanced", "supervised"]), default=None)
 @click.option("--no-llm", "no_llm", is_flag=True, default=False, help="Run without LLM server.")
-def run_cmd(input_path: Path, database_path: Path, autonomy: str | None, no_llm: bool) -> None:
+@click.option(
+    "--detectability-mode",
+    type=click.Choice(["uniform", "sequence_features", "file"]),
+    default=None,
+    help="Peptide detectability weighting mode for the abundance_em taxon algorithm.",
+)
+@click.option(
+    "--detectability-file",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="TSV with pre-computed detectability scores (required when --detectability-mode=file).",
+)
+@click.option(
+    "--resolve-uniprot/--no-resolve-uniprot",
+    default=None,
+    help="Resolve bare UniProt accession FASTA headers via the UniProt REST API (default: on).",
+)
+def run_cmd(
+    input_path: Path,
+    database_path: Path,
+    autonomy: str | None,
+    no_llm: bool,
+    detectability_mode: str | None,
+    detectability_file: Path | None,
+    resolve_uniprot: bool | None,
+) -> None:
     """Start a new run or resume latest if user confirms."""
 
     if no_llm:
         os.environ["NO_LLM_MODE"] = "true"
+    if detectability_mode:
+        os.environ["TAXON_DETECTABILITY_MODE"] = detectability_mode
+    if detectability_file:
+        os.environ["TAXON_DETECTABILITY_FILE"] = str(detectability_file)
+    if detectability_mode == "file" and not detectability_file:
+        console.print(Panel("--detectability-file is required when --detectability-mode=file.", style="red"))
+        raise SystemExit(1)
+    if resolve_uniprot is not None:
+        os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
@@ -196,10 +230,42 @@ def start_server_cmd() -> None:
 @cli.command("run-pipeline")
 @click.option("--input", "input_path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--db", "database_path", required=True, type=click.Path(exists=True, path_type=Path))
-def run_pipeline_cmd(input_path: Path, database_path: Path) -> None:
+@click.option(
+    "--detectability-mode",
+    type=click.Choice(["uniform", "sequence_features", "file"]),
+    default=None,
+    help="Peptide detectability weighting mode for the abundance_em taxon algorithm.",
+)
+@click.option(
+    "--detectability-file",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="TSV with pre-computed detectability scores (required when --detectability-mode=file).",
+)
+@click.option(
+    "--resolve-uniprot/--no-resolve-uniprot",
+    default=None,
+    help="Resolve bare UniProt accession FASTA headers via the UniProt REST API (default: on).",
+)
+def run_pipeline_cmd(
+    input_path: Path,
+    database_path: Path,
+    detectability_mode: str | None,
+    detectability_file: Path | None,
+    resolve_uniprot: bool | None,
+) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
     os.environ["NO_LLM_MODE"] = "true"
+    if detectability_mode:
+        os.environ["TAXON_DETECTABILITY_MODE"] = detectability_mode
+    if detectability_file:
+        os.environ["TAXON_DETECTABILITY_FILE"] = str(detectability_file)
+    if detectability_mode == "file" and not detectability_file:
+        console.print(Panel("--detectability-file is required when --detectability-mode=file.", style="red"))
+        raise SystemExit(1)
+    if resolve_uniprot is not None:
+        os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)

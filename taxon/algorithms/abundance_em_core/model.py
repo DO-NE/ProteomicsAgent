@@ -83,6 +83,19 @@ class AbundanceEM:
         samples from Dirichlet(1, ..., 1). Restarts always use random.
     seed : int or None, optional
         Random seed for reproducibility.
+    detectability_mode : {"uniform", "sequence_features", "file"}, optional
+        How to compute per-peptide detectability weights (default
+        ``"uniform"``).  ``"uniform"`` reproduces the original unweighted
+        emission model.  ``"sequence_features"`` uses physicochemical
+        features via :class:`SequenceFeaturePredictor`.  ``"file"`` loads
+        pre-computed scores via :class:`DbyDeepPredictor`.
+    detectability_file : str or None, optional
+        Path to a TSV file with pre-computed detectability scores (required
+        when ``detectability_mode='file'`` unless ``detectability_weights``
+        is given directly).
+    detectability_weights : np.ndarray or None, optional
+        Direct injection of a ``(P,)`` weight vector.  When provided this
+        overrides the mode-based computation.
 
     Attributes
     ----------
@@ -112,6 +125,9 @@ class AbundanceEM:
         min_abundance: float = 1e-4,
         init: str = "unique",
         seed: Optional[int] = None,
+        detectability_mode: str = "uniform",
+        detectability_file: Optional[str] = None,
+        detectability_weights: Optional[np.ndarray] = None,
     ) -> None:
         if alpha <= 0:
             raise ValueError("alpha must be > 0")
@@ -123,6 +139,19 @@ class AbundanceEM:
             raise ValueError("n_restarts must be >= 1")
         if init not in ("unique", "uniform", "random"):
             raise ValueError("init must be 'unique', 'uniform', or 'random'")
+        if detectability_mode not in ("uniform", "sequence_features", "file"):
+            raise ValueError(
+                "detectability_mode must be 'uniform', 'sequence_features', "
+                "or 'file'"
+            )
+        if (
+            detectability_mode == "file"
+            and detectability_file is None
+            and detectability_weights is None
+        ):
+            raise ValueError(
+                "detectability_file is required when detectability_mode='file'"
+            )
 
         self.alpha = float(alpha)
         self.max_iter = int(max_iter)
@@ -131,6 +160,13 @@ class AbundanceEM:
         self.min_abundance = float(min_abundance)
         self.init = init
         self.seed = seed
+        self.detectability_mode = detectability_mode
+        self.detectability_file = detectability_file
+        self.detectability_weights = (
+            np.asarray(detectability_weights, dtype=np.float64)
+            if detectability_weights is not None
+            else None
+        )
 
         # Set after fit().
         self.pi_: Optional[np.ndarray] = None
@@ -146,10 +182,16 @@ class AbundanceEM:
         self._M: Optional[np.ndarray] = None
         self._y: Optional[np.ndarray] = None
         self._taxon_names: Optional[list] = None
+        self._W: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ public
 
-    def fit(self, A: np.ndarray, y: np.ndarray) -> "AbundanceEM":
+    def fit(
+        self,
+        A: np.ndarray,
+        y: np.ndarray,
+        peptide_sequences: Optional[list] = None,
+    ) -> "AbundanceEM":
         """Fit the model.
 
         Parameters
@@ -160,6 +202,11 @@ class AbundanceEM:
             comparing to zero.
         y : np.ndarray, shape ``(P,)``
             Spectral count vector (non-negative).
+        peptide_sequences : list of str or None, optional
+            Peptide amino-acid sequences, required when
+            ``detectability_mode='sequence_features'``. If ``None`` and mode
+            is not ``'uniform'``, falls back to uniform emission with a
+            warning (unless ``detectability_weights`` was provided directly).
 
         Returns
         -------
@@ -206,6 +253,9 @@ class AbundanceEM:
         if (n_t == 0).any():
             M[:, n_t == 0] = 0.0
 
+        # Build the (possibly detectability-weighted) emission matrix.
+        W = self._build_emission_matrix(A_bin, M, peptide_sequences)
+
         # Edge case: T == 1 forces pi = [1.0]; skip EM entirely.
         if T == 1:
             pi = np.array([1.0])
@@ -214,13 +264,14 @@ class AbundanceEM:
             responsibilities[mask, 0] = 1.0
             self._A = A_bin
             self._M = M
+            self._W = W
             self._y = y_arr
             self.pi_ = pi
             self.responsibilities_ = responsibilities
-            self.log_posterior_history_ = [self._log_posterior(pi, M, y_arr)]
+            self.log_posterior_history_ = [self._log_posterior(pi, W, y_arr)]
             self.converged_ = True
             self.n_iter_ = 0
-            self.standard_errors_ = self._compute_standard_errors(pi, M, y_arr)
+            self.standard_errors_ = self._compute_standard_errors(pi, W, y_arr)
             return self
 
         rng = np.random.default_rng(self.seed)
@@ -231,7 +282,7 @@ class AbundanceEM:
                 pi0 = self._initial_pi(self.init, T, A_bin, y_arr, rng)
             else:
                 pi0 = self._initial_pi("random", T, A_bin, y_arr, rng)
-            state = self._run_em(pi0, M, y_arr)
+            state = self._run_em(pi0, W, y_arr)
             logger.info(
                 "EM restart %d/%d: %d iters, log-posterior=%.6f, converged=%s",
                 restart + 1,
@@ -257,17 +308,18 @@ class AbundanceEM:
                 else:  # pathological: everything fell below threshold
                     pi = np.full(T, 1.0 / T)
 
-        responsibilities = self._responsibilities(pi, M)
+        responsibilities = self._responsibilities(pi, W)
 
         self._A = A_bin
         self._M = M
+        self._W = W
         self._y = y_arr
         self.pi_ = pi
         self.responsibilities_ = responsibilities
         self.log_posterior_history_ = best.log_posterior_history
         self.converged_ = best.converged
         self.n_iter_ = best.n_iter
-        self.standard_errors_ = self._compute_standard_errors(pi, M, y_arr)
+        self.standard_errors_ = self._compute_standard_errors(pi, W, y_arr)
         return self
 
     def predict(self) -> np.ndarray:
@@ -332,6 +384,73 @@ class AbundanceEM:
         return results
 
     # ----------------------------------------------------------------- internals
+
+    def _build_emission_matrix(
+        self,
+        A_bin: np.ndarray,
+        M: np.ndarray,
+        peptide_sequences: Optional[list],
+    ) -> np.ndarray:
+        """Compute the emission matrix, optionally weighted by detectability.
+
+        When ``detectability_mode='uniform'`` (and no direct weights are
+        injected), the unweighted matrix ``M`` is returned unchanged.
+        Otherwise, per-peptide detectability scores are used to build a
+        column-normalised weighted emission matrix ``W``.
+        """
+        # Fast path: uniform mode with no override weights.
+        if self.detectability_mode == "uniform" and self.detectability_weights is None:
+            return M
+
+        # Determine the weight vector d.
+        if self.detectability_weights is not None:
+            d = self.detectability_weights
+        elif self.detectability_mode == "sequence_features":
+            if peptide_sequences is None:
+                logger.warning(
+                    "detectability_mode='sequence_features' but no peptide "
+                    "sequences provided; falling back to uniform emission"
+                )
+                return M
+            from .detectability import SequenceFeaturePredictor
+
+            d = SequenceFeaturePredictor().predict(peptide_sequences)
+        elif self.detectability_mode == "file":
+            if self.detectability_file is None:
+                logger.warning(
+                    "detectability_mode='file' but no file path provided; "
+                    "falling back to uniform emission"
+                )
+                return M
+            from .detectability import DbyDeepPredictor
+
+            d = DbyDeepPredictor(self.detectability_file).predict(
+                peptide_sequences or []
+            )
+        else:
+            return M
+
+        P = A_bin.shape[0]
+        if d.shape[0] != P:
+            raise ValueError(
+                f"detectability weights length ({d.shape[0]}) must match "
+                f"number of peptides ({P})"
+            )
+
+        # W_{pt} = d_p * A_{pt} / sum_{p'}(d_{p'} * A_{p't})
+        dA = A_bin * d[:, np.newaxis]
+        col_sums = dA.sum(axis=0)
+        col_sums_safe = np.where(col_sums == 0, 1.0, col_sums)
+        W = dA / col_sums_safe[np.newaxis, :]
+        W[:, col_sums == 0] = 0.0
+
+        logger.info(
+            "Applied detectability weights: min=%.4f, max=%.4f, mean=%.4f",
+            float(d.min()),
+            float(d.max()),
+            float(d.mean()),
+        )
+        return W
 
     @staticmethod
     def _initial_pi(

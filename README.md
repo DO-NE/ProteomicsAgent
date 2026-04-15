@@ -477,8 +477,62 @@ config = {
     "enzyme": "trypsin",
     "missed_cleavages": 2,
     "seed": 42,
+    "detectability_mode": "uniform",  # or "sequence_features", "file"
+    # "detectability_file": "/path/to/scores.tsv",  # required for "file" mode
 }
 ```
+
+#### Peptide detectability weighting
+
+The default emission model assumes all peptides from a taxon are equally likely to be observed: `M[p,t] = A[p,t] / n_t`. This causes bias when taxa have incomplete proteomes in the FASTA database, because peptides with different physicochemical properties are detected at different rates by the mass spectrometer.
+
+Detectability weighting introduces per-peptide scores `d_p` that modify emission:
+
+```
+Uniform:   P(p|t) = A[p,t] / n_t
+Weighted:  P(p|t) = d_p * A[p,t] / sum_{p'}(d_{p'} * A[p',t])
+```
+
+The weighted emission matrix `W` replaces `M` in the E-step. Weights are computed once before EM iterations begin; the M-step is unchanged.
+
+**Modes:**
+
+| Mode | Description |
+|---|---|
+| `"uniform"` | All weights = 1.0; reproduces the original model (default) |
+| `"sequence_features"` | Computes weights from peptide physicochemical features |
+| `"file"` | Loads pre-computed weights from a TSV file |
+
+**`sequence_features` mode** uses `SequenceFeaturePredictor`, which scores peptides by combining five features multiplicatively:
+
+| Feature | Rationale |
+|---|---|
+| Length (Gaussian, centre 13 aa) | Tryptic peptides of 8-18 aa ionise and fragment best; very short/long peptides are penalised |
+| Hydrophobicity (GRAVY ~0.25) | Moderately hydrophobic peptides have optimal ESI ionisation efficiency |
+| Charge at pH 2 (optimal 2-3) | Doubly/triply charged peptides are most commonly detected in standard DDA |
+| Missed cleavages (0.7x per site) | Each internal K/R represents a missed cleavage, reducing detection probability |
+| Proline content (mild bonus) | Proline aids CID fragmentation, improving identification |
+
+All scores are floored at `epsilon = 0.01` so no peptide receives zero weight.
+
+**`file` mode** loads a tab-separated file with header row and two columns:
+
+```tsv
+peptide_sequence	detectability_score
+AGIVDEK	0.85
+PEPTIDER	0.72
+```
+
+Peptides not found in the file fall back to `SequenceFeaturePredictor`. The number of lookup hits vs. fallbacks is logged.
+
+**Direct weight injection** (programmatic use only): pass a `(P,)` numpy array as `detectability_weights` to the `AbundanceEM` constructor. This overrides the mode setting.
+
+**Future plans:** Integration with deep-learning detectability predictors (e.g. DbyDeep, PeptideRank) via the `DetectabilityPredictor` abstract interface. The plug-in architecture supports swapping in learned models without touching the EM code.
+
+**Known limitations:**
+- `SequenceFeaturePredictor` uses a hand-tuned logistic combination of physicochemical features; it has not been trained on experimental data and should be considered a reasonable baseline, not a calibrated predictor.
+- Detectability scores are static: they do not account for matrix effects, ion suppression, or LC gradient position, which vary across runs.
+- When few peptides are observed per taxon, the effect of detectability weighting is modest compared to the statistical noise in spectral counts.
 
 The core algorithm (`taxon/algorithms/abundance_em_core/`) is fully independent of the ProteomicsAgent runtime and can be imported and used standalone:
 
