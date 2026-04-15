@@ -68,6 +68,7 @@ class PeptideIdentification(PipelineStage):
                 ),
                 encoding="utf-8",
             )
-        cmd = [comet_path, f"-P{param_file}", str(input_mzml)]
+        output_base = run_dir / input_mzml.stem
+        cmd = [comet_path, f"-P{param_file}", f"-N{output_base}", str(input_mzml)]
         self.execute(cmd, self.name, "comet", dry_run=dry_run)
-        return str(input_mzml.with_suffix(".pep.xml"))
+        return str(output_base.with_suffix(".pep.xml"))
