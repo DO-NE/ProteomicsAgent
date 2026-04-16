@@ -244,6 +244,10 @@ class Orchestrator:
             config["resolve_uniprot"] = bool(params["resolve_uniprot"])
         elif resolve_uniprot_env is not None:
             config["resolve_uniprot"] = resolve_uniprot_env.lower() not in ("0", "false", "no")
+        prefix_map_file = params.get("prefix_map_file") or os.getenv("TAXON_PREFIX_MAP_FILE")
+        if prefix_map_file:
+            config["prefix_map_file"] = prefix_map_file
+        config["output_dir"] = str(self.run_dir)
 
         results = self.taxon_registry.run(algorithm, peptides, config)
         self.latest_taxon_results = results

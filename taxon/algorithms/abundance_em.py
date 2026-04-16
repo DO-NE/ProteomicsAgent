@@ -78,6 +78,14 @@ class AbundanceEMPlugin(TaxonPlugin):
         UniProt accession headers (e.g. ``>Q2FYC6``) to their source
         organism via a cached UniProt REST lookup, preventing those
         proteins from being bucketed as ``unclassified``.
+    prefix_map_file : str
+        Path to a two-column TSV (no header) mapping accession prefixes
+        to organism names (``<prefix>\\t<organism>``).  Used to rescue
+        FASTA entries whose headers lack organism annotations.
+    output_dir : str
+        Directory where auxiliary output files (e.g.
+        ``unclassified_entries.tsv``) are written.  When unset, no
+        auxiliary files are produced.
     """
 
     name = "abundance_em"
@@ -130,6 +138,8 @@ class AbundanceEMPlugin(TaxonPlugin):
         detectability_mode = str(config.get("detectability_mode", "uniform"))
         detectability_file = config.get("detectability_file")
         resolve_uniprot = bool(config.get("resolve_uniprot", True))
+        prefix_map_file = config.get("prefix_map_file")
+        output_dir = config.get("output_dir")
 
         # When a pepXML is available, derive peptides and spectral counts
         # from the PSM-level data instead of the caller-supplied protein list.
@@ -149,7 +159,7 @@ class AbundanceEMPlugin(TaxonPlugin):
             return []
 
         # Build the mapping matrix.
-        A, peptide_list, taxon_labels = build_mapping_matrix(
+        A, peptide_list, taxon_labels, unclassified_peptides = build_mapping_matrix(
             peptides=peptides,
             fasta_path=fasta_path,
             enzyme=enzyme,
@@ -159,7 +169,25 @@ class AbundanceEMPlugin(TaxonPlugin):
             exclude_prefixes=exclude_prefixes,
             pepxml_protein_map=pepxml_protein_map,
             resolve_uniprot=resolve_uniprot,
+            prefix_map_file=str(prefix_map_file) if prefix_map_file else None,
         )
+
+        # Write unclassified entries to a diagnostic TSV.
+        if unclassified_peptides and output_dir:
+            taxon_dir = Path(str(output_dir)) / "taxon"
+            taxon_dir.mkdir(parents=True, exist_ok=True)
+            tsv_path = taxon_dir / "unclassified_entries.tsv"
+            with tsv_path.open("w", encoding="utf-8") as fh:
+                fh.write("peptide_sequence\tprotein_accession\n")
+                for pep, acc in unclassified_peptides:
+                    fh.write(f"{pep}\t{acc}\n")
+            n_unique = len({pep for pep, _acc in unclassified_peptides})
+            logger.info(
+                "%d peptide(s) mapped only to unclassified proteins "
+                "(excluded from EM). Details written to %s",
+                n_unique, tsv_path,
+            )
+
         if A.shape[1] == 0:
             logger.warning(
                 "AbundanceEMPlugin: no peptides matched any taxon in %s",

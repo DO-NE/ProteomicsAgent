@@ -109,6 +109,13 @@ def cli() -> None:
     default=None,
     help="Resolve bare UniProt accession FASTA headers via the UniProt REST API (default: on).",
 )
+@click.option(
+    "--prefix-map",
+    "prefix_map",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="TSV mapping accession prefixes to organism names (two columns, no header).",
+)
 def run_cmd(
     input_path: Path,
     database_path: Path,
@@ -117,6 +124,7 @@ def run_cmd(
     detectability_mode: str | None,
     detectability_file: Path | None,
     resolve_uniprot: bool | None,
+    prefix_map: Path | None,
 ) -> None:
     """Start a new run or resume latest if user confirms."""
 
@@ -131,6 +139,8 @@ def run_cmd(
         raise SystemExit(1)
     if resolve_uniprot is not None:
         os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
+    if prefix_map:
+        os.environ["TAXON_PREFIX_MAP_FILE"] = str(prefix_map)
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
@@ -247,12 +257,20 @@ def start_server_cmd() -> None:
     default=None,
     help="Resolve bare UniProt accession FASTA headers via the UniProt REST API (default: on).",
 )
+@click.option(
+    "--prefix-map",
+    "prefix_map",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="TSV mapping accession prefixes to organism names (two columns, no header).",
+)
 def run_pipeline_cmd(
     input_path: Path,
     database_path: Path,
     detectability_mode: str | None,
     detectability_file: Path | None,
     resolve_uniprot: bool | None,
+    prefix_map: Path | None,
 ) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
@@ -266,6 +284,8 @@ def run_pipeline_cmd(
         raise SystemExit(1)
     if resolve_uniprot is not None:
         os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
+    if prefix_map:
+        os.environ["TAXON_PREFIX_MAP_FILE"] = str(prefix_map)
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
