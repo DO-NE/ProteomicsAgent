@@ -247,6 +247,9 @@ class Orchestrator:
         prefix_map_file = params.get("prefix_map_file") or os.getenv("TAXON_PREFIX_MAP_FILE")
         if prefix_map_file:
             config["prefix_map_file"] = prefix_map_file
+        taxon_level = params.get("taxon_level") or os.getenv("TAXON_LEVEL")
+        if taxon_level:
+            config["taxon_level"] = taxon_level
         config["output_dir"] = str(self.run_dir)
 
         results = self.taxon_registry.run(algorithm, peptides, config)

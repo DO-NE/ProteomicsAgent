@@ -60,6 +60,18 @@ _BIOCHEM_BLACKLIST = frozenset({
     "mn", "zn", "fe", "cu", "mg",
 })
 
+# Structural patterns indicating SEED/RAST gene identifiers rather than taxa.
+_SEED_SUBSTRINGS = ("seed:", "fig|", "_peg.", "_peg ", "peg.")
+_LOCUS_TAG_RE = re.compile(r"[A-Za-z]+[0-9]*_[a-z]+\.[0-9]+")
+
+# Sub-species / infraspecific markers stripped during species-level
+# normalisation.  Each marker includes a LEADING SPACE so that strings like
+# "Burkholderiaceae" are not falsely clipped by a bare "bv".
+_SUBSPECIES_MARKERS = (
+    " bv. ", " subsp. ", " var. ", " strain ", " str. ", " pv. ",
+    " serovar ", " serotype ", " biotype ", " ecotype ",
+)
+
 
 def build_mapping_matrix(
     peptides: list,
@@ -72,6 +84,7 @@ def build_mapping_matrix(
     pepxml_protein_map: dict | None = None,
     resolve_uniprot: bool = False,
     prefix_map_file: str | None = None,
+    taxon_level: str = "species",
 ) -> tuple:
     """Build a peptide-taxon mapping matrix from a FASTA database.
 
@@ -97,6 +110,10 @@ def build_mapping_matrix(
         names (``<prefix>\\t<organism>``, no header).  Entries take
         priority over the automatic prefix-cohort inference and are used
         to rescue unclassified entries that share a prefix.
+    taxon_level : str, optional
+        ``"species"`` (default) or ``"strain"``.  Controls the depth of
+        name normalisation applied to organism strings extracted from
+        FASTA headers (see :func:`_normalize_taxon_name`).
 
     Returns
     -------
@@ -183,7 +200,7 @@ def build_mapping_matrix(
         total_proteins += 1
         accession = _extract_accession(header)
         uniprot_acc = extract_uniprot_accession(accession)
-        key, rejected_name = _parse_header_detailed(header)
+        key, rejected_name = _parse_header_detailed(header, taxon_level=taxon_level)
         if rejected_name is not None:
             rejected_by_filter += 1
             logger.debug(
@@ -298,6 +315,37 @@ def build_mapping_matrix(
         rescued_by_user,
         still_unclassified,
     )
+
+    # --- Species-level deduplication ------------------------------------
+    # After normalisation, multiple strain-level OX ids may map to the
+    # same species name (e.g. OX=123 and OX=456 both yield "Rhizobium
+    # leguminosarum").  Merge them into a single canonical key so that
+    # the EM sees one column per species.
+    name_to_keys: dict = {}  # taxon_name -> set of (taxon_id, taxon_name)
+    for _acc, _uacc, key, _seq in final_records:
+        if key != ("0", "unclassified"):
+            name_to_keys.setdefault(key[1], set()).add(key)
+
+    key_remap: dict = {}
+    for tname, keys in name_to_keys.items():
+        if len(keys) > 1:
+            canonical = (_slug(tname), tname)
+            for k in keys:
+                if k != canonical:
+                    key_remap[k] = canonical
+
+    if key_remap:
+        n_original = sum(len(ks) for ks in name_to_keys.values() if len(ks) > 1)
+        n_merged = sum(1 for ks in name_to_keys.values() if len(ks) > 1)
+        logger.info(
+            "Collapsed %d strain-level entries into %d species-level taxa",
+            n_original,
+            n_merged,
+        )
+        final_records = [
+            (acc, uacc, key_remap.get(key, key), seq)
+            for acc, uacc, key, seq in final_records
+        ]
 
     # Bucket the resolved records.  Unclassified proteins are tracked
     # separately so we can digest them to find peptides that would be
@@ -543,8 +591,16 @@ def _iter_fasta(path: Path) -> Iterator[tuple]:
             yield header, "".join(seq_lines)
 
 
-def _parse_header(header: str) -> tuple:
+def _parse_header(header: str, taxon_level: str = "species") -> tuple:
     """Extract a ``(taxon_id, taxon_name)`` pair from a FASTA header.
+
+    Parameters
+    ----------
+    header : str
+        Raw FASTA header line (without the leading ``>``).
+    taxon_level : str
+        ``"species"`` (default) or ``"strain"``.  Passed through to
+        :func:`_normalize_taxon_name`.
 
     Candidate organism names are validated by :func:`_is_valid_taxon_name`;
     candidates that look like functional annotations (e.g. ``"ATP synthase"``)
@@ -557,12 +613,29 @@ def _parse_header(header: str) -> tuple:
     4. Inline ``taxon_<id>`` markers.
     5. Pipe-prefixed organism (``>OrganismName|accession|...``).
     """
-    key, _ = _parse_header_detailed(header)
+    key, _ = _parse_header_detailed(header, taxon_level=taxon_level)
     return key
 
 
-def _parse_header_detailed(header: str) -> tuple:
+# Namespace markers that should never be treated as organism names when they
+# appear before the first pipe character.
+_PIPE_NAMESPACE_BLACKLIST = frozenset({
+    "sp", "tr", "gi", "ref", "gb", "seed", "fig", "peg",
+})
+
+
+def _parse_header_detailed(
+    header: str, taxon_level: str = "species",
+) -> tuple:
     """Like :func:`_parse_header` but also reports filtered candidates.
+
+    Parameters
+    ----------
+    header : str
+        Raw FASTA header line (without the leading ``>``).
+    taxon_level : str
+        ``"species"`` (default) or ``"strain"``.  Forwarded to
+        :func:`_normalize_taxon_name` for every candidate name.
 
     Returns
     -------
@@ -581,7 +654,7 @@ def _parse_header_detailed(header: str) -> tuple:
     os_match = _OS_RE.search(header)
     if os_match:
         raw_name = os_match.group(1).strip()
-        name = _normalize_taxon_name(raw_name)
+        name = _normalize_taxon_name(raw_name, level=taxon_level)
         if _is_valid_taxon_name(name):
             taxon_id = ox.group(1) if ox else _slug(name)
             return (taxon_id, name), None
@@ -590,7 +663,8 @@ def _parse_header_detailed(header: str) -> tuple:
     # 2. GeneMark species="..."
     species_match = _SPECIES_RE.search(header)
     if species_match:
-        name = species_match.group(1).strip()
+        raw_name = species_match.group(1).strip()
+        name = _normalize_taxon_name(raw_name, level=taxon_level)
         if _is_valid_taxon_name(name):
             return (_slug(name), name), None
         return ("0", "unclassified"), name
@@ -598,7 +672,8 @@ def _parse_header_detailed(header: str) -> tuple:
     # 3. NCBI bracketed organism
     bracket = _BRACKET_RE.search(header)
     if bracket:
-        name = bracket.group(1).strip()
+        raw_name = bracket.group(1).strip()
+        name = _normalize_taxon_name(raw_name, level=taxon_level)
         if _is_valid_taxon_name(name):
             taxid = ox.group(1) if ox else _slug(name)
             return (taxid, name), None
@@ -611,17 +686,20 @@ def _parse_header_detailed(header: str) -> tuple:
         return (inline.group(1), f"taxon_{inline.group(1)}"), None
 
     # 5. Pipe-prefixed organism: >OrganismName|accession|description
+    #    Tightened: the pre-pipe token must contain at least one whitespace
+    #    character ("Genus species" pattern).  Single tokens before a pipe
+    #    are almost always accession or namespace markers, not organisms.
     if "|" in header:
         first = header.split("|", 1)[0].strip()
-        # Heuristic: treat as an organism only if it has at least one alpha
-        # char and is not a common UniProt namespace marker.
         if (
             first
-            and first.lower() not in {"sp", "tr", "gi", "ref", "gb"}
+            and first.lower() not in _PIPE_NAMESPACE_BLACKLIST
             and re.search(r"[A-Za-z]", first)
+            and " " in first
         ):
-            if _is_valid_taxon_name(first):
-                return (_slug(first), first), None
+            name = _normalize_taxon_name(first, level=taxon_level)
+            if _is_valid_taxon_name(name):
+                return (_slug(name), name), None
             return ("0", "unclassified"), first
 
     return ("0", "unclassified"), None
@@ -630,29 +708,63 @@ def _parse_header_detailed(header: str) -> tuple:
 def _is_valid_taxon_name(name: str) -> bool:
     """Reject obvious non-taxonomic strings (functional annotations etc.).
 
-    A candidate ``name`` is rejected when any of the following holds:
+    **Structural checks** (run first, cheapest):
 
-    - It is empty, or whitespace only.
-    - (Case-insensitive) it contains any entry of
-      :data:`_FUNCTIONAL_KEYWORDS` -- e.g. ``"ATP synthase"`` contains
-      ``"synthase"`` and is rejected.
-    - It normalises (lowercased, stripped) to one of the biochemical
-      abbreviations in :data:`_BIOCHEM_BLACKLIST`.
-    - It is a single token of four or fewer characters (e.g. ``"Mn"``,
-      ``"pepG"``) -- real organism names are either multi-word binomials
-      or longer codes.
+    - Empty / whitespace-only.
+    - Contains tab ``\\t``, newline ``\\n``, or pipe ``|`` characters
+      (e.g. ``"AK199_peg.906\\tSEED:fig"`` → **rejected**).
+    - Contains two or more consecutive whitespace characters, which
+      usually indicate column-separated text, not a species name
+      (e.g. ``"ORF1  some desc"`` → **rejected**).
+    - Contains SEED/RAST gene-ID substrings (case-insensitive):
+      ``"SEED:"``, ``"fig|"``, ``"_peg."``, ``"_peg "``, ``"peg."``
+      (e.g. ``"AK199_peg.906 SEED:fig"`` → **rejected**).
+    - Matches the gene-locus-tag pattern
+      ``[A-Za-z]+[0-9]*_[a-z]+\\.[0-9]+`` anywhere in the string
+      (e.g. ``"CV_peg.67"`` → **rejected**).
+    - Contains **no lowercase letters** at all — real binomial names
+      always have a lowercase species epithet; all-caps strings are
+      accession codes or abbreviations
+      (e.g. ``"FIG027190"`` → **rejected**,
+      ``"Escherichia coli"`` → accepted).
+
+    **Semantic checks** (existing):
+
+    - Biochemical abbreviation blacklist (e.g. ``"ATP"``).
+    - Functional-annotation keyword scan (e.g. ``"synthase"``).
+    - Single token of four or fewer characters.
     """
     if not name or not name.strip():
         return False
+
+    # --- Structural checks (cheap, catch SEED/RAST junk) ---
+
+    # Control / separator characters
+    if re.search(r"[\t\n|]", name):
+        return False
+    # Multiple consecutive whitespace (column-separated text)
+    if re.search(r"\s{2,}", name):
+        return False
+    # SEED/RAST gene-identifier substrings (case-insensitive)
     lowered = name.strip().lower()
+    for sub in _SEED_SUBSTRINGS:
+        if sub in lowered:
+            return False
+    # Gene-locus-tag pattern (e.g. AK199_peg.906, CV_peg.67)
+    if _LOCUS_TAG_RE.search(name):
+        return False
+    # No lowercase letters at all → accession code, not a taxon name
+    if not re.search(r"[a-z]", name):
+        return False
+
+    # --- Semantic checks (existing) ---
+
     if lowered in _BIOCHEM_BLACKLIST:
         return False
     for kw in _FUNCTIONAL_KEYWORDS:
         if kw in lowered:
             return False
-    # Reject very short single-word names; real species names are typically
-    # either multi-word (e.g. "Homo sapiens") or strain codes well over four
-    # characters (e.g. "AK199Rb", "K-12MG1655").
+    # Reject very short single-word names.
     if len(name.split()) == 1 and len(name.strip()) <= 4:
         return False
     return True
@@ -731,14 +843,73 @@ def _slug(name: str) -> str:
     return cleaned or "unknown"
 
 
-def _normalize_taxon_name(name: str) -> str:
-    """Strip strain/subspecies details in trailing parentheses.
+def _normalize_taxon_name(name: str, level: str = "species") -> str:
+    """Normalise a raw organism string to a canonical taxon name.
 
-    ``"Pseudomonas aeruginosa (strain ATCC 15692 ...)"``
-    → ``"Pseudomonas aeruginosa"``
+    Always strips trailing parenthetical content (strain annotations that
+    appear inside parentheses, e.g. ``"(strain ATCC 15692)"``).
+
+    When *level* is ``"species"`` (the default) three additional
+    reductions are applied:
+
+    1. **Sub-species markers** — the name is truncated at the first
+       occurrence of any of: ``" bv. "``, ``" subsp. "``, ``" var. "``,
+       ``" strain "``, ``" str. "``, ``" pv. "``, ``" serovar "``,
+       ``" serotype "``, ``" biotype "``, ``" ecotype "``.
+    2. **Colon suffixes** — trailing ``" : <AlphanumericToken>"`` is
+       stripped (common in JGI/IMG identifiers).
+    3. **Binomial truncation** — if the result has three or more tokens
+       where the first is Capitalised and the second is lowercase
+       (classic binomial pattern), only the first two are kept.
+
+    When *level* is ``"strain"``, only the parenthetical strip is applied
+    and the remaining text is returned as-is.
+
+    Examples
+    --------
+    >>> _normalize_taxon_name("Pseudomonas aeruginosa (strain ATCC 15692)")
+    'Pseudomonas aeruginosa'
+    >>> _normalize_taxon_name("Rhizobium leguminosarum bv. viciae 3841", level="species")
+    'Rhizobium leguminosarum'
+    >>> _normalize_taxon_name("Pseudomonas fluorescens ATCC 13525 : Ga0070645_11", level="species")
+    'Pseudomonas fluorescens'
+    >>> _normalize_taxon_name("Rhizobium leguminosarum bv. viciae 3841", level="strain")
+    'Rhizobium leguminosarum bv. viciae 3841'
     """
-    stripped = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
-    return stripped or name
+    # Step 0: strip trailing parenthetical content (always, both modes).
+    result = re.sub(r"\s*\(.*?\)\s*$", "", name).strip() or name
+
+    if level == "strain":
+        return result
+
+    # --- species-level reductions ---
+
+    # Step 1: strip from first sub-species marker onward.
+    result_lower = result.lower()
+    earliest = len(result)
+    for marker in _SUBSPECIES_MARKERS:
+        idx = result_lower.find(marker)
+        if 0 <= idx < earliest:
+            earliest = idx
+    if earliest < len(result):
+        result = result[:earliest].strip()
+
+    # Step 2: strip trailing " : AlphanumericToken" suffix.
+    colon_match = re.search(r" : ([A-Za-z0-9_]+)\s*$", result)
+    if colon_match:
+        result = result[: colon_match.start()].strip()
+
+    # Step 3: binomial truncation — keep first two tokens when the name
+    # looks like "Genus species <extra stuff>".
+    tokens = result.split()
+    if (
+        len(tokens) >= 3
+        and tokens[0][:1].isupper()
+        and tokens[1][:1].islower()
+    ):
+        result = " ".join(tokens[:2])
+
+    return result or name
 
 
 def _should_exclude(header: str, exclude_prefixes: list | None) -> bool:

@@ -82,6 +82,10 @@ class AbundanceEMPlugin(TaxonPlugin):
         Path to a two-column TSV (no header) mapping accession prefixes
         to organism names (``<prefix>\\t<organism>``).  Used to rescue
         FASTA entries whose headers lack organism annotations.
+    taxon_level : str
+        ``"species"`` (default) or ``"strain"``.  Controls organism-name
+        normalisation depth: species mode collapses strain-level variants
+        into binomials; strain mode preserves sub-species identifiers.
     output_dir : str
         Directory where auxiliary output files (e.g.
         ``unclassified_entries.tsv``) are written.  When unset, no
@@ -140,6 +144,7 @@ class AbundanceEMPlugin(TaxonPlugin):
         resolve_uniprot = bool(config.get("resolve_uniprot", True))
         prefix_map_file = config.get("prefix_map_file")
         output_dir = config.get("output_dir")
+        taxon_level = str(config.get("taxon_level", "species"))
 
         # When a pepXML is available, derive peptides and spectral counts
         # from the PSM-level data instead of the caller-supplied protein list.
@@ -170,6 +175,7 @@ class AbundanceEMPlugin(TaxonPlugin):
             pepxml_protein_map=pepxml_protein_map,
             resolve_uniprot=resolve_uniprot,
             prefix_map_file=str(prefix_map_file) if prefix_map_file else None,
+            taxon_level=taxon_level,
         )
 
         # Write unclassified entries to a diagnostic TSV.

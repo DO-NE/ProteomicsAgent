@@ -116,6 +116,12 @@ def cli() -> None:
     default=None,
     help="TSV mapping accession prefixes to organism names (two columns, no header).",
 )
+@click.option(
+    "--taxon-level",
+    type=click.Choice(["species", "strain"]),
+    default=None,
+    help="Organism-name normalisation depth: species collapses strains to binomials, strain preserves them.",
+)
 def run_cmd(
     input_path: Path,
     database_path: Path,
@@ -125,6 +131,7 @@ def run_cmd(
     detectability_file: Path | None,
     resolve_uniprot: bool | None,
     prefix_map: Path | None,
+    taxon_level: str | None,
 ) -> None:
     """Start a new run or resume latest if user confirms."""
 
@@ -141,6 +148,8 @@ def run_cmd(
         os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
     if prefix_map:
         os.environ["TAXON_PREFIX_MAP_FILE"] = str(prefix_map)
+    if taxon_level:
+        os.environ["TAXON_LEVEL"] = taxon_level
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
@@ -264,6 +273,12 @@ def start_server_cmd() -> None:
     default=None,
     help="TSV mapping accession prefixes to organism names (two columns, no header).",
 )
+@click.option(
+    "--taxon-level",
+    type=click.Choice(["species", "strain"]),
+    default=None,
+    help="Organism-name normalisation depth: species collapses strains to binomials, strain preserves them.",
+)
 def run_pipeline_cmd(
     input_path: Path,
     database_path: Path,
@@ -271,6 +286,7 @@ def run_pipeline_cmd(
     detectability_file: Path | None,
     resolve_uniprot: bool | None,
     prefix_map: Path | None,
+    taxon_level: str | None,
 ) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
@@ -286,6 +302,8 @@ def run_pipeline_cmd(
         os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
     if prefix_map:
         os.environ["TAXON_PREFIX_MAP_FILE"] = str(prefix_map)
+    if taxon_level:
+        os.environ["TAXON_LEVEL"] = taxon_level
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
