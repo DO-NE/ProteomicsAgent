@@ -204,6 +204,61 @@ class AbundanceEMPlugin(TaxonPlugin):
         # Build the spectral count vector aligned with peptide_list.
         y = self._build_count_vector(peptide_list, spectral_counts)
 
+        # ----------------------------------------------------------------- #
+        # PRE-EM DIAGNOSTIC BLOCK — remove when no longer needed            #
+        # ----------------------------------------------------------------- #
+        import numpy as np
+
+        _row_sums = A.sum(axis=1)  # number of taxa each peptide maps to
+        _y_total = float(y.sum())
+
+        logger.info("=== PRE-EM DIAGNOSTIC ===")
+        logger.info(
+            "Total PSMs: %d, Total peptides: %d, Total taxa: %d",
+            int(_y_total), len(peptide_list), A.shape[1],
+        )
+
+        # Per-taxon stats
+        _taxon_rows = []
+        for _col, _lbl in enumerate(taxon_labels):
+            _name = _lbl.split("|", 1)[-1]
+            _col_vec = np.asarray(A[:, _col]).ravel()
+            _maps_here = _col_vec > 0
+            _unique_mask = _maps_here & (_row_sums == 1)
+            _n_mapped = int(_maps_here.sum())
+            _n_unique = int(_unique_mask.sum())
+            _total_sc = float(y[_maps_here].sum())
+            _unique_sc = float(y[_unique_mask].sum())
+            _sc_frac = 100.0 * _total_sc / _y_total if _y_total > 0 else 0.0
+            _taxon_rows.append((_name, _n_mapped, _n_unique, _total_sc, _unique_sc, _sc_frac))
+
+        _taxon_rows.sort(key=lambda r: r[3], reverse=True)
+
+        logger.info(
+            "%-40s %8s %8s %10s %10s %8s",
+            "Taxon", "Mapped", "Unique", "TotalSC", "UniqueSC", "SC%",
+        )
+        for _row in _taxon_rows[:20]:
+            _name, _n_mapped, _n_unique, _total_sc, _unique_sc, _sc_frac = _row
+            logger.info(
+                "%-40s %8d %8d %10d %10d %7.2f%%",
+                _name[:40], _n_mapped, _n_unique, int(_total_sc), int(_unique_sc), _sc_frac,
+            )
+
+        # Summary stats
+        logger.info(
+            "Peptides with zero counts: %d | map to 1 taxon: %d | map to >1 taxon: %d",
+            int((y == 0).sum()),
+            int((_row_sums == 1).sum()),
+            int((_row_sums > 1).sum()),
+        )
+        logger.info(
+            "Taxa with zero unique peptides: %d / %d",
+            sum(1 for r in _taxon_rows if r[2] == 0), len(_taxon_rows),
+        )
+        logger.info("=== END PRE-EM DIAGNOSTIC ===")
+        # ----------------------------------------------------------------- #
+
         # Identifiability report (best-effort, non-fatal).
         if run_id_check:
             try:
