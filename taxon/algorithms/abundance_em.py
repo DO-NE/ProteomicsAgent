@@ -10,10 +10,15 @@ contributed to the observed peptide evidence.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from taxon.base_plugin import TaxonPlugin, TaxonResult
 
+from .abundance_em_core.biomass_correction import (
+    compute_biomass_corrections,
+    log_biomass_diagnostics,
+)
 from .abundance_em_core.identifiability import identifiability_report
 from .abundance_em_core.mapping_matrix import build_mapping_matrix
 from .abundance_em_core.model import AbundanceEM
@@ -90,6 +95,17 @@ class AbundanceEMPlugin(TaxonPlugin):
         Directory where auxiliary output files (e.g.
         ``unclassified_entries.tsv``) are written.  When unset, no
         auxiliary files are produced.
+    biomass_mode : str
+        ``"correct"`` (default) applies per-taxon biomass correction so
+        the reported abundances approximate protein-biomass proportions.
+        ``"none"`` disables correction and reproduces the legacy
+        PSM-level abundance. May also be set via the
+        ``TAXON_BIOMASS_MODE`` environment variable.
+    min_psm_threshold : int
+        PSM count required for a protein to count as "detected" when
+        computing the proteome-coverage component of the biomass
+        correction (default ``2``).  May also be set via
+        ``TAXON_MIN_PSM_THRESHOLD``.
     """
 
     name = "abundance_em"
@@ -145,6 +161,18 @@ class AbundanceEMPlugin(TaxonPlugin):
         prefix_map_file = config.get("prefix_map_file")
         output_dir = config.get("output_dir")
         taxon_level = str(config.get("taxon_level", "species"))
+        biomass_mode = str(
+            config.get(
+                "biomass_mode",
+                os.environ.get("TAXON_BIOMASS_MODE", "correct"),
+            )
+        )
+        min_psm_threshold = int(
+            config.get(
+                "min_psm_threshold",
+                os.environ.get("TAXON_MIN_PSM_THRESHOLD", "2"),
+            )
+        )
 
         # When a pepXML is available, derive peptides and spectral counts
         # from the PSM-level data instead of the caller-supplied protein list.
@@ -204,10 +232,54 @@ class AbundanceEMPlugin(TaxonPlugin):
         # Build the spectral count vector aligned with peptide_list.
         y = self._build_count_vector(peptide_list, spectral_counts)
 
+        import numpy as np
+
+        # ----------------------------------------------------------------- #
+        # BIOMASS CORRECTION                                                #
+        # ----------------------------------------------------------------- #
+        # Decide whether to convert PSM-share abundance into biomass-share
+        # abundance. When the pepXML-derived peptide_protein_map is absent
+        # the coverage component degenerates (no per-protein PSM signal),
+        # so we warn but still apply the length-yield component.
+        biomass_corrections = None
+        if biomass_mode == "correct":
+            if not spectral_counts:
+                logger.warning(
+                    "biomass_mode='correct' but no spectral_counts are "
+                    "available; skipping biomass correction."
+                )
+            else:
+                if not pepxml_protein_map:
+                    logger.warning(
+                        "biomass_mode='correct' with no peptide-protein "
+                        "map (pepXML absent); g_coverage will degenerate "
+                        "to a uniform 1/total_proteins per taxon."
+                    )
+                biomass_corrections, biomass_diagnostics = (
+                    compute_biomass_corrections(
+                        fasta_path=fasta_path,
+                        taxon_labels=taxon_labels,
+                        spectral_counts=spectral_counts,
+                        peptide_protein_map=pepxml_protein_map or {},
+                        enzyme=enzyme,
+                        missed_cleavages=missed_cleavages,
+                        min_length=min_length,
+                        max_length=max_length,
+                        exclude_prefixes=exclude_prefixes,
+                        min_psm_threshold=min_psm_threshold,
+                        resolve_uniprot=resolve_uniprot,
+                    )
+                )
+                log_biomass_diagnostics(biomass_diagnostics, logger=logger)
+        elif biomass_mode != "none":
+            logger.warning(
+                "Unknown biomass_mode=%r; no correction will be applied.",
+                biomass_mode,
+            )
+
         # ----------------------------------------------------------------- #
         # PRE-EM DIAGNOSTIC BLOCK — remove when no longer needed            #
         # ----------------------------------------------------------------- #
-        import numpy as np
 
         _row_sums = A.sum(axis=1)  # number of taxa each peptide maps to
         _y_total = float(y.sum())
@@ -230,19 +302,27 @@ class AbundanceEMPlugin(TaxonPlugin):
             _total_sc = float(y[_maps_here].sum())
             _unique_sc = float(y[_unique_mask].sum())
             _sc_frac = 100.0 * _total_sc / _y_total if _y_total > 0 else 0.0
-            _taxon_rows.append((_name, _n_mapped, _n_unique, _total_sc, _unique_sc, _sc_frac))
+            _g = (
+                float(biomass_corrections[_col])
+                if biomass_corrections is not None
+                else 1.0
+            )
+            _taxon_rows.append(
+                (_name, _n_mapped, _n_unique, _total_sc, _unique_sc, _sc_frac, _g)
+            )
 
         _taxon_rows.sort(key=lambda r: r[3], reverse=True)
 
         logger.info(
-            "%-40s %8s %8s %10s %10s %8s",
-            "Taxon", "Mapped", "Unique", "TotalSC", "UniqueSC", "SC%",
+            "%-40s %8s %8s %10s %10s %8s %12s",
+            "Taxon", "Mapped", "Unique", "TotalSC", "UniqueSC", "SC%", "g_t",
         )
         for _row in _taxon_rows[:20]:
-            _name, _n_mapped, _n_unique, _total_sc, _unique_sc, _sc_frac = _row
+            _name, _n_mapped, _n_unique, _total_sc, _unique_sc, _sc_frac, _g = _row
             logger.info(
-                "%-40s %8d %8d %10d %10d %7.2f%%",
-                _name[:40], _n_mapped, _n_unique, int(_total_sc), int(_unique_sc), _sc_frac,
+                "%-40s %8d %8d %10d %10d %7.2f%% %12.3e",
+                _name[:40], _n_mapped, _n_unique,
+                int(_total_sc), int(_unique_sc), _sc_frac, _g,
             )
 
         # Summary stats
@@ -281,8 +361,14 @@ class AbundanceEMPlugin(TaxonPlugin):
             seed=seed,
             detectability_mode=detectability_mode,
             detectability_file=detectability_file,
+            biomass_corrections=biomass_corrections,
         )
         model.fit(A, y, peptide_sequences=peptide_list)
+        if biomass_corrections is not None:
+            logger.info(
+                "Biomass correction applied — abundances represent "
+                "estimated protein biomass proportions"
+            )
         logger.info(
             "AbundanceEM converged=%s in %d iterations (final lp=%.4f)",
             model.converged_,
@@ -295,6 +381,25 @@ class AbundanceEMPlugin(TaxonPlugin):
         confidences = self._confidences(model.standard_errors_)
         responsibilities = model.responsibilities_
 
+        # Recover the equivalent PSM-level abundance vector for reporting.
+        # When no correction was applied, psm_pi == pi_ by construction.
+        pi_full = np.asarray(model.pi_, dtype=np.float64)
+        g_full = (
+            np.asarray(biomass_corrections, dtype=np.float64)
+            if biomass_corrections is not None
+            else np.ones_like(pi_full)
+        )
+        psm_num = pi_full * g_full
+        psm_total = float(psm_num.sum())
+        psm_pi = (
+            psm_num / psm_total
+            if psm_total > 0
+            else np.full_like(pi_full, 1.0 / pi_full.shape[0])
+        )
+
+        # Rows for the biomass-enhanced TSV (parallel to ``results``).
+        biomass_rows: list = []
+
         for col, label in enumerate(taxon_labels):
             abundance = float(model.pi_[col])
             if abundance <= min_abundance:
@@ -305,19 +410,53 @@ class AbundanceEMPlugin(TaxonPlugin):
             assigned_idx = [i for i in range(A.shape[0]) if responsibilities[i, col] > 0.5]
             assigned_peptides = [peptide_list[i] for i in assigned_idx]
 
-            results.append(
-                TaxonResult(
-                    taxon_id=taxon_id,
-                    taxon_name=taxon_name,
-                    rank="species",
-                    abundance=abundance,
-                    confidence=float(confidences[col]),
-                    peptide_count=len(assigned_peptides),
-                    peptides=assigned_peptides,
-                )
+            result = TaxonResult(
+                taxon_id=taxon_id,
+                taxon_name=taxon_name,
+                rank="species",
+                abundance=abundance,
+                confidence=float(confidences[col]),
+                peptide_count=len(assigned_peptides),
+                peptides=assigned_peptides,
+            )
+            results.append(result)
+            biomass_rows.append(
+                {
+                    "taxon_id": taxon_id,
+                    "taxon_name": taxon_name,
+                    "rank": "species",
+                    "abundance": abundance,
+                    "confidence": float(confidences[col]),
+                    "peptide_count": len(assigned_peptides),
+                    "biomass_correction_factor": float(g_full[col]),
+                    "psm_abundance": float(psm_pi[col]),
+                }
             )
 
         results.sort(key=lambda r: r.abundance, reverse=True)
+        biomass_rows.sort(key=lambda r: r["abundance"], reverse=True)
+
+        # Optional TSV with biomass-correction columns.
+        if output_dir:
+            taxon_dir = Path(str(output_dir)) / "taxon"
+            taxon_dir.mkdir(parents=True, exist_ok=True)
+            tsv_path = taxon_dir / "abundance_em_results.tsv"
+            with tsv_path.open("w", encoding="utf-8") as fh:
+                fh.write(
+                    "taxon_id\ttaxon_name\trank\tabundance_pct\tconfidence\t"
+                    "peptide_count\tbiomass_correction_factor\tpsm_abundance_pct\n"
+                )
+                for row in biomass_rows:
+                    fh.write(
+                        f"{row['taxon_id']}\t{row['taxon_name']}\t"
+                        f"{row['rank']}\t{row['abundance'] * 100:.4f}\t"
+                        f"{row['confidence']:.4f}\t"
+                        f"{row['peptide_count']}\t"
+                        f"{row['biomass_correction_factor']:.6e}\t"
+                        f"{row['psm_abundance'] * 100:.4f}\n"
+                    )
+            logger.info("Wrote biomass-annotated results to %s", tsv_path)
+
         return results
 
     # ----------------------------------------------------------------- helpers

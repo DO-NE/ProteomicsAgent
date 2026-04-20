@@ -96,6 +96,15 @@ class AbundanceEM:
     detectability_weights : np.ndarray or None, optional
         Direct injection of a ``(P,)`` weight vector.  When provided this
         overrides the mode-based computation.
+    biomass_corrections : np.ndarray or None, optional
+        Per-taxon biomass correction factors ``g_t`` of shape ``(T,)``.
+        When provided, each column ``t`` of the emission matrix is divided
+        by ``g_t`` (without renormalisation), so the un-normalised column
+        sums encode relative PSM productivity per unit biomass. Under this
+        parametrisation ``pi`` is interpreted as a biomass simplex rather
+        than a PSM simplex. All entries must be strictly positive.
+        When ``None`` (default), behaviour is identical to the unmodified
+        multinomial-mixture model.
 
     Attributes
     ----------
@@ -114,6 +123,9 @@ class AbundanceEM:
     fisher_singular_ : bool
         True if the observed information matrix was rank-deficient and a
         pseudoinverse was used.
+    biomass_corrections_ : np.ndarray or None, shape ``(T,)``
+        Per-taxon correction factors used during fitting, or ``None`` if
+        no corrections were supplied.
     """
 
     def __init__(
@@ -128,6 +140,7 @@ class AbundanceEM:
         detectability_mode: str = "uniform",
         detectability_file: Optional[str] = None,
         detectability_weights: Optional[np.ndarray] = None,
+        biomass_corrections: Optional[np.ndarray] = None,
     ) -> None:
         if alpha <= 0:
             raise ValueError("alpha must be > 0")
@@ -167,6 +180,12 @@ class AbundanceEM:
             if detectability_weights is not None
             else None
         )
+        # Cached at __init__ time; shape-validated in fit() once T is known.
+        self._biomass_corrections: Optional[np.ndarray] = (
+            np.asarray(biomass_corrections, dtype=np.float64)
+            if biomass_corrections is not None
+            else None
+        )
 
         # Set after fit().
         self.pi_: Optional[np.ndarray] = None
@@ -176,6 +195,7 @@ class AbundanceEM:
         self.n_iter_: int = 0
         self.standard_errors_: Optional[np.ndarray] = None
         self.fisher_singular_: bool = False
+        self.biomass_corrections_: Optional[np.ndarray] = None
 
         # Cached internals (not part of public API).
         self._A: Optional[np.ndarray] = None
@@ -232,6 +252,19 @@ class AbundanceEM:
         if T == 0:
             raise ValueError("A must have at least one taxon column")
 
+        # Validate biomass corrections now that T is known.
+        if self._biomass_corrections is not None:
+            if self._biomass_corrections.shape != (T,):
+                raise ValueError(
+                    f"biomass_corrections must have shape ({T},), got "
+                    f"{self._biomass_corrections.shape}"
+                )
+            if not np.all(self._biomass_corrections > 0):
+                raise ValueError(
+                    "biomass_corrections must be strictly positive "
+                    "(all g_t > 0)"
+                )
+
         # Coerce to binary float matrix once.
         A_bin = (A_arr != 0).astype(np.float64)
         n_t = A_bin.sum(axis=0)  # repertoire sizes
@@ -255,6 +288,22 @@ class AbundanceEM:
 
         # Build the (possibly detectability-weighted) emission matrix.
         W = self._build_emission_matrix(A_bin, M, peptide_sequences)
+
+        # Apply per-taxon biomass correction: W[:, t] /= g_t. This deflates
+        # columns of high-yield taxa so that equal biomass across taxa yields
+        # unequal PSM probability, and the EM (which maximises the likelihood
+        # under pi) directly estimates a biomass simplex. The columns are
+        # intentionally left un-normalised after this division.
+        if self._biomass_corrections is not None:
+            W = W / self._biomass_corrections[np.newaxis, :]
+            logger.info(
+                "Applied biomass corrections: min=%.4e, max=%.4e, mean=%.4e",
+                float(self._biomass_corrections.min()),
+                float(self._biomass_corrections.max()),
+                float(self._biomass_corrections.mean()),
+            )
+
+        self.biomass_corrections_ = self._biomass_corrections
 
         # Edge case: T == 1 forces pi = [1.0]; skip EM entirely.
         if T == 1:
