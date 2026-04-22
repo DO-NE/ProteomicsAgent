@@ -231,6 +231,7 @@ class Orchestrator:
             "fasta_path": params.get("fasta_path", self.state.database_path),
             "database_path": params.get("database_path", self.state.database_path),
             "spectral_counts": spectral_counts,
+            "pepxml_path": pepxml_path,
         }
 
         detectability_mode = params.get("detectability_mode") or os.getenv("TAXON_DETECTABILITY_MODE")
