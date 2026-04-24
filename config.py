@@ -17,9 +17,15 @@ class Settings:
 
     llm_backend: str = "llama"
     llama_server_url: str = "http://localhost:8000/v1"
+    openai_api_url: str = "https://api.openai.com/v1"
+    openai_api_key: str = ""
+    openai_model_id: str = ""
     anthropic_api_key: str = ""
+    anthropic_base_url: str = "https://api.anthropic.com/v1"
+    anthropic_model_id: str = "claude-sonnet-4-6"
     msfragger_path: str = ""
     comet_path: str = ""
+    comet_params_path: str = ""
     tpp_bin_path: str = ""
     percolator_path: str = ""
     output_dir: str = "./output"
@@ -37,9 +43,15 @@ def load_settings() -> Settings:
     return Settings(
         llm_backend=os.getenv("LLM_BACKEND", "llama").strip().lower(),
         llama_server_url=os.getenv("LLAMA_SERVER_URL", "http://localhost:8000/v1").strip(),
+        openai_api_url=os.getenv("OPENAI_API_URL", "https://api.openai.com/v1").strip(),
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_model_id=os.getenv("OPENAI_MODEL_ID", "gpt-5.4").strip(),
+        anthropic_base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1").strip(),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        anthropic_model_id=os.getenv("ANTHROPIC_MODEL_ID", "claude-sonnet-4-6").strip(),
         msfragger_path=os.getenv("MSFRAGGER_PATH", "").strip(),
         comet_path=os.getenv("COMET_PATH", "").strip(),
+        comet_params_path=os.getenv("COMET_PARAMS_PATH", "").strip(),
         tpp_bin_path=os.getenv("TPP_BIN_PATH", "").strip(),
         percolator_path=os.getenv("PERCOLATOR_PATH", "").strip(),
         output_dir=os.getenv("OUTPUT_DIR", "./output").strip(),
@@ -102,7 +114,12 @@ def check_tools(settings: Settings | None = None) -> dict[str, bool]:
     status: dict[str, bool] = {}
     for tool, raw_path in tool_paths.items():
         path = Path(raw_path).expanduser() if raw_path else Path("")
-        ok = _is_executable(path) if raw_path else False
+        if not raw_path:
+            ok = False
+        elif path.suffix == ".jar":
+            ok = path.exists() and path.is_file()
+        else:
+            ok = _is_executable(path)
         status[tool] = ok
         table.add_row(tool, str(path) if raw_path else "(not configured)", "✓ found" if ok else "✗ missing")
 

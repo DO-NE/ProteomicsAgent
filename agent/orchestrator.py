@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -68,6 +69,17 @@ class Orchestrator:
             self.state.autonomy_mode = input("Select autonomy mode (full/balanced/supervised): ").strip().lower() or "balanced"
             self.state_manager.save(self.state)
 
+        self.log_path = self.run_dir / "chat.log"
+        self._turn = 0
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.log_path.open("a", encoding="utf-8") as _f:
+            _f.write(
+                f"\n{'═' * 80}\n"
+                f"SESSION STARTED: {ts} | Run ID: {self.state.run_id} | Backend: {settings.llm_backend}\n"
+                f"{'═' * 80}\n"
+            )
+
         self.stages = {
             "format_conversion": FormatConversion(),
             "peptide_id": PeptideIdentification(),
@@ -104,8 +116,23 @@ class Orchestrator:
             completed_stages=", ".join(self.state.completed_stages),
         )
 
+    def _log_event(self, label: str, content: str) -> None:
+        """Append a labelled, timestamped event block to the chat log file."""
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sep = "─" * 80
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n{sep}\n[{ts}] {label}\n{sep}\n{content}\n")
+
+    _MAX_ACTION_RETRIES = 2
+
     def _parse_action(self, response: str) -> dict | None:
-        """Extract action dictionary from LLM ACTION block."""
+        """Extract and validate action dictionary from LLM ACTION block.
+
+        Returns None when:
+        - No <ACTION> block is present.
+        - The params value is not valid JSON.
+        - The required 'tool' field is absent.
+        """
 
         match = re.search(r"<ACTION>(.*?)</ACTION>", response, flags=re.DOTALL)
         if not match:
@@ -119,10 +146,60 @@ class Orchestrator:
             key = key.strip()
             value = value.strip()
             if key == "params":
-                action[key] = json.loads(value) if value else {}
+                if not value:
+                    action[key] = {}
+                else:
+                    try:
+                        action[key] = json.loads(value)
+                    except json.JSONDecodeError as exc:
+                        self.console.print(
+                            f"[yellow]Warning: malformed params JSON in ACTION block: {exc}[/yellow]"
+                        )
+                        return None
             else:
                 action[key] = value
+
+        if not action.get("tool"):
+            self.console.print("[yellow]Warning: ACTION block is missing the 'tool' field.[/yellow]")
+            return None
+
         return action
+
+    def _request_action_repair(self, bad_response: str, attempt: int) -> str:
+        """Re-query the LLM with a targeted correction when the action block was invalid.
+
+        Injects a correction message into a *temporary* history copy so that
+        self.history is never polluted with the repair exchange.
+        """
+
+        raw_match = re.search(r"<ACTION>.*?</ACTION>", bad_response, flags=re.DOTALL)
+        raw_block = raw_match.group(0) if raw_match else "(no <ACTION> block found)"
+
+        correction = (
+            "Your previous response contained an invalid ACTION block that could not be "
+            "parsed:\n\n"
+            f"{raw_block}\n\n"
+            "Common causes:\n"
+            "  • params value is not valid JSON (use double-quoted keys, no trailing commas)\n"
+            "  • 'tool' field is missing\n\n"
+            "Please respond **only** with a corrected ACTION block using this exact format:\n\n"
+            "<ACTION>\n"
+            "tool: <run_pipeline_stage | run_taxon_inference | show_state | "
+            "generate_figures | export_report | ask_question>\n"
+            "stage: <stage_name>  (only required for run_pipeline_stage)\n"
+            'params: {"key": "value"}  (must be valid JSON; use {} if no params needed)\n'
+            "</ACTION>\n\n"
+            f"Repair attempt {attempt}/{self._MAX_ACTION_RETRIES}."
+        )
+
+        self._log_event(
+            f"TURN {self._turn} — ACTION REPAIR PROMPT (attempt {attempt}/{self._MAX_ACTION_RETRIES})",
+            correction,
+        )
+
+        repair_history = self.history + [{"role": "user", "content": correction}]
+        system_prompt = self._build_system_prompt()
+        return llm_client.chat(repair_history, system_prompt, self.settings)
 
     def _approve_action(self, tool: str, stage: str | None, params: dict) -> tuple[bool, dict]:
         """Apply autonomy mode gating and optionally allow param edits."""
@@ -175,6 +252,7 @@ class Orchestrator:
             "database_path": self.state.database_path,
             "msfragger_path": self.settings.msfragger_path,
             "comet_path": self.settings.comet_path,
+            "comet_params_path": self.settings.comet_params_path,
             "tpp_bin_path": self.settings.tpp_bin_path,
             "percolator_path": self.settings.percolator_path,
         }
@@ -253,13 +331,21 @@ class Orchestrator:
             config["taxon_level"] = taxon_level
         config["output_dir"] = str(self.run_dir)
 
+        # Forward any additional plugin-specific params (e.g. method, top_n).
+        for k, v in params.items():
+            if k not in config:
+                config[k] = v
+
         results = self.taxon_registry.run(algorithm, peptides, config)
         self.latest_taxon_results = results
         self.state.taxon_algorithm = algorithm
         self.state_manager.save(self.state)
 
         taxon_dir = self.run_dir / "taxon"
-        tsv_path = export_tsv(results, taxon_dir, "results.tsv")
+        method = params.get("method", "")
+        default_filename = f"{algorithm}_{method}.tsv" if method else f"{algorithm}.tsv"
+        filename = params.get("output_filename", default_filename)
+        tsv_path = export_tsv(results, taxon_dir, filename)
 
         # mark complete so resume works
         self.state_manager.mark_stage_complete("taxon_inference", str(tsv_path))
@@ -303,6 +389,103 @@ class Orchestrator:
         path = export_summary(self.state, self.latest_taxon_results, self.latest_figures, report_dir)
         return {"status": "ok", "path": path}
 
+    _OTHER_SENTINEL = "__other__"
+
+    def ask_question(self, params: dict) -> dict:
+        """Present an interactive question with arrow-key navigation."""
+
+        import questionary
+        from questionary import Choice, Style
+
+        question = str(params.get("question", "What would you like to do?"))
+        q_type = str(params.get("type", "decision"))
+        options = params.get("options", [])
+        if not isinstance(options, list):
+            options = []
+
+        type_labels = {
+            "clarification": "Clarification Needed",
+            "decision": "Decision",
+            "parameter": "Parameter Input",
+        }
+        type_label = type_labels.get(q_type, q_type.title())
+
+        style = Style([
+            ("qmark", "fg:cyan bold"),
+            ("question", "bold"),
+            ("answer", "fg:green bold"),
+            ("pointer", "fg:cyan bold"),
+            ("highlighted", "fg:cyan bold"),
+            ("selected", "fg:green"),
+        ])
+
+        # Build questionary choices
+        choices: list[Choice] = []
+        for opt in options:
+            if isinstance(opt, str):
+                label, desc = opt, ""
+            else:
+                label = opt.get("label", "")
+                desc = opt.get("description", "")
+            title = f"{label} — {desc}" if desc else label
+            choices.append(Choice(title=title, value=label))
+        choices.append(Choice(
+            title="Other (type your own response)",
+            value=self._OTHER_SENTINEL,
+        ))
+
+        # Show context panel
+        self.console.print(Panel(
+            f"[bold]{question}[/bold]",
+            title=type_label,
+            border_style="cyan",
+        ))
+
+        # Selection loop — user can go back from "Other" to the option list
+        while True:
+            selected = questionary.select(
+                "Select an option:",
+                choices=choices,
+                style=style,
+                instruction="(arrow keys to move, enter to select)",
+            ).ask()
+
+            if selected is None:
+                # User pressed Ctrl-C — treat as cancel
+                return {"status": "cancelled", "message": "Question cancelled by user."}
+
+            if selected != self._OTHER_SENTINEL:
+                self.console.print(f"\n  [green]Selected:[/green] {selected}\n")
+                return {"status": "ok", "answer": selected, "type": q_type}
+
+            # "Other" selected — prompt for free text
+            custom = questionary.text(
+                "Your response:",
+                style=style,
+            ).ask()
+
+            if custom is None or not custom.strip():
+                # Ctrl-C or empty — go back to option list
+                self.console.print("[dim]  Going back to options...[/dim]\n")
+                continue
+
+            custom = custom.strip()
+
+            # Confirm or go back
+            confirm = questionary.confirm(
+                f'Send "{custom}"?',
+                default=True,
+                style=style,
+            ).ask()
+
+            if confirm:
+                self.console.print(f"\n  [green]Selected:[/green] {custom}\n")
+                return {"status": "ok", "answer": custom, "type": q_type}
+
+            # User declined — back to option list
+            self.console.print("[dim]  Going back to options...[/dim]\n")
+            continue
+
     def _execute_action(self, action: dict) -> dict:
         """Dispatch action to tool method."""
 
@@ -311,6 +494,10 @@ class Orchestrator:
         params = action.get("params", {})
         if not isinstance(params, dict):
             params = {}
+
+        # ask_question is user-facing by nature — skip the approval gate
+        if tool == "ask_question":
+            return self.ask_question(params)
 
         approved, params = self._approve_action(tool, str(stage) if stage else None, params)
         if not approved:
@@ -391,21 +578,92 @@ class Orchestrator:
             return
 
         self.console.print("[green]Type 'exit' or 'quit' to end the session.[/green]")
+        pending_input: str | None = None
         while True:
-            user_text = input("> ").strip()
-            if user_text.lower() in {"exit", "quit"}:
-                self.console.print("[green]Session ended.[/green]")
-                break
+            if pending_input is not None:
+                user_text = pending_input
+                pending_input = None
+            else:
+                user_text = input("> ").strip()
+                if user_text.lower() in {"exit", "quit"}:
+                    self.console.print("[green]Session ended.[/green]")
+                    break
 
+            self._turn += 1
             self.history.append({"role": "user", "content": user_text})
+            self._log_event(f"TURN {self._turn} — USER MESSAGE", user_text)
+
             system_prompt = self._build_system_prompt()
-            response = llm_client.chat(self.history, system_prompt)
+            self._log_event(f"TURN {self._turn} — SYSTEM PROMPT", system_prompt)
+            self._log_event(
+                f"TURN {self._turn} — CONVERSATION HISTORY (sent to LLM)",
+                json.dumps(self.history, indent=2, ensure_ascii=False),
+            )
+
+            response = llm_client.chat(self.history, system_prompt, self.settings)
             self.console.print(Markdown(response))
             self.history.append({"role": "assistant", "content": response})
+            self._log_event(f"TURN {self._turn} — LLM RESPONSE", response)
+
+            raw_action_match = re.search(r"<ACTION>.*?</ACTION>", response, flags=re.DOTALL)
+            if raw_action_match:
+                self._log_event(
+                    f"TURN {self._turn} — RAW ACTION BLOCK [PRE-EXECUTE]",
+                    raw_action_match.group(0),
+                )
 
             action = self._parse_action(response)
+
+            # Fail-safe: model produced an action block but it was invalid → repair loop
+            if raw_action_match and action is None:
+                self.console.print(
+                    "[yellow]Invalid ACTION block detected — attempting repair...[/yellow]"
+                )
+                for attempt in range(1, self._MAX_ACTION_RETRIES + 1):
+                    repair_response = self._request_action_repair(response, attempt)
+                    self._log_event(
+                        f"TURN {self._turn} — ACTION REPAIR RESPONSE (attempt {attempt}/{self._MAX_ACTION_RETRIES})",
+                        repair_response,
+                    )
+                    raw_repair_match = re.search(r"<ACTION>.*?</ACTION>", repair_response, flags=re.DOTALL)
+                    if raw_repair_match:
+                        self._log_event(
+                            f"TURN {self._turn} — RAW ACTION BLOCK [REPAIR attempt {attempt}] [PRE-EXECUTE]",
+                            raw_repair_match.group(0),
+                        )
+                    action = self._parse_action(repair_response)
+                    if action:
+                        self.console.print(f"[green]Action repaired on attempt {attempt}.[/green]")
+                        break
+                else:
+                    self.console.print(
+                        f"[red]Action repair failed after {self._MAX_ACTION_RETRIES} attempts — "
+                        "skipping action.[/red]"
+                    )
+                    self._log_event(
+                        f"TURN {self._turn} — ACTION REPAIR FAILED",
+                        f"All {self._MAX_ACTION_RETRIES} repair attempts exhausted. Action skipped.",
+                    )
+
             if action:
                 result = self._execute_action(action)
+
+                self._log_event(
+                    f"TURN {self._turn} — ACTION RESULT",
+                    json.dumps(result, indent=2, ensure_ascii=False),
+                )
+
+                # ask_question: feed the answer back to the LLM automatically
+                if action.get("tool") == "ask_question":
+                    if result.get("status") == "ok":
+                        pending_input = result["answer"]
+                        continue
+                    # cancelled — let the user type the next message
+                    self.console.print("[dim]Question cancelled.[/dim]")
+                    continue
+
                 tool_msg = f"Tool result: {json.dumps(result, indent=2)}"
                 self.console.print(Panel(tool_msg, title="Action Result"))
-                self.history.append({"role": "assistant", "content": tool_msg})
+                # Feed the result back as the next user message so the LLM
+                # automatically sees and reacts to it (including errors).
+                pending_input = tool_msg

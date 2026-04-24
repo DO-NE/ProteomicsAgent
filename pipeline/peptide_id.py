@@ -49,20 +49,26 @@ class PeptideIdentification(PipelineStage):
             return str(input_mzml.with_suffix(".pepXML"))
 
         comet_path = params.get("comet_path", "")
+        comet_params_path = params.get("comet_params_path", "")
         param_file = params_dir / "comet.params"
-        param_file.write_text(
-            "\n".join(
-                [
-                    f"database_name = {database_path}",
-                    "peptide_mass_tolerance = 10.0",
-                    "peptide_mass_units = 2",
-                    "num_enzyme_termini = 2",
-                    "missed_cleavages = 1",
-                    "minimum_length = 7",
-                ]
-            ),
-            encoding="utf-8",
-        )
-        cmd = [comet_path, f"-P{param_file}", str(input_mzml)]
+        if comet_params_path and Path(comet_params_path).is_file():
+            import shutil
+            shutil.copy(comet_params_path, param_file)
+        else:
+            param_file.write_text(
+                "\n".join(
+                    [
+                        f"database_name = {database_path}",
+                        "peptide_mass_tolerance = 10.0",
+                        "peptide_mass_units = 2",
+                        "num_enzyme_termini = 2",
+                        "missed_cleavages = 1",
+                        "minimum_length = 7",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        output_base = run_dir / input_mzml.stem
+        cmd = [comet_path, f"-P{param_file}", f"-N{output_base}", str(input_mzml)]
         self.execute(cmd, self.name, "comet", dry_run=dry_run)
-        return str(input_mzml.with_suffix(".pep.xml"))
+        return str(output_base.with_suffix(".pep.xml"))

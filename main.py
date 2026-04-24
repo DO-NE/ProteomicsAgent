@@ -70,7 +70,7 @@ def _startup_checks() -> bool:
         console.print("[yellow]Running in no-LLM mode. LLM server will not be used.[/yellow]")
         return True
 
-    if not _llm_server_reachable(settings.llama_server_url):
+    if settings.llm_backend == "llama" and not _llm_server_reachable(settings.llama_server_url):
         console.print(
             Panel(
                 "LLM server not running. Start it first with: python main.py start-server",

@@ -26,4 +26,5 @@ dependencies:
     - python-dotenv>=1.0.0
     - rich>=13.7.0
     - click>=8.1.0
+    - questionary>=2.0.0
     - huggingface_hub>=0.23.0

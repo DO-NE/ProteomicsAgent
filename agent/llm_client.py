@@ -1,21 +1,25 @@
-"""LLM chat client supporting llama-cpp OpenAI mode and Anthropic fallback."""
+"""LLM chat client supporting llama-cpp, OpenAI-compatible, and Anthropic backends."""
 
 from __future__ import annotations
 
-import os
 import re
 import time
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 
+if TYPE_CHECKING:
+    from config import Settings
 
-def _call_llama(messages: list[dict[str, str]], temperature: float) -> str:
+
+def _call_llama(
+    messages: list[dict[str, str]],
+    temperature: float,
+    base_url: str,
+) -> str:
     from openai import OpenAI
 
-    client = OpenAI(
-        base_url=os.getenv("LLAMA_SERVER_URL", "http://localhost:8000/v1"),
-        api_key="none",
-    )
+    client = OpenAI(base_url=base_url, api_key="none")
     response = client.chat.completions.create(
         model="local",
         temperature=temperature,
@@ -24,12 +28,45 @@ def _call_llama(messages: list[dict[str, str]], temperature: float) -> str:
     return response.choices[0].message.content or ""
 
 
-def _call_claude(messages: list[dict[str, str]], system_prompt: str, temperature: float) -> str:
+def _call_openai_compatible(
+    messages: list[dict[str, str]],
+    temperature: float,
+    base_url: str,
+    api_key: str,
+    model: str,
+) -> str:
+    from openai import OpenAI
+
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Set it in .env or environment variables."
+        )
+    client = OpenAI(base_url=base_url, api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=messages,
+    )
+    return response.choices[0].message.content or ""
+
+
+def _call_claude(
+    messages: list[dict[str, str]],
+    system_prompt: str,
+    temperature: float,
+    base_url: str,
+    api_key: str,
+    model: str,
+) -> str:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+    if not api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. Set it in .env or environment variables."
+        )
+    client = anthropic.Anthropic(base_url=base_url, api_key=api_key)
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=model,
         max_tokens=2048,
         temperature=temperature,
         system=system_prompt,
@@ -42,7 +79,6 @@ def _call_claude(messages: list[dict[str, str]], system_prompt: str, temperature
 
 def _next_incomplete_stage(system_prompt: str) -> str:
     """Parse completed stages from the system prompt and return the next ACTION."""
-    import json as _json
 
     stages = [
         "format_conversion", "peptide_id", "validation",
@@ -66,13 +102,13 @@ def _next_incomplete_stage(system_prompt: str) -> str:
     )
 
 
-def chat(messages: list[dict], system_prompt: str) -> str:
+def chat(messages: list[dict], system_prompt: str, settings: Settings) -> str:
     """Send chat messages to configured backend with retries and return text output."""
 
-    if os.getenv("NO_LLM_MODE", "false").strip().lower() == "true":
+    if settings.no_llm_mode:
         return _next_incomplete_stage(system_prompt)
 
-    backend = os.getenv("LLM_BACKEND", "llama").strip().lower()
+    backend = settings.llm_backend
     console = Console()
     retries = [1, 2, 4]
     prepared_messages = [{"role": "system", "content": system_prompt}] + [
@@ -82,14 +118,38 @@ def chat(messages: list[dict], system_prompt: str) -> str:
     for attempt, backoff in enumerate(retries, start=1):
         try:
             if backend == "claude":
-                return _call_claude(prepared_messages, system_prompt, temperature=0.2)
-            return _call_llama(prepared_messages, temperature=0.2)
+                return _call_claude(
+                    prepared_messages,
+                    system_prompt,
+                    temperature=0.2,
+                    base_url=settings.anthropic_base_url,
+                    api_key=settings.anthropic_api_key,
+                    model=settings.anthropic_model_id,
+                )
+            if backend == "openai":
+                return _call_openai_compatible(
+                    prepared_messages,
+                    temperature=0.2,
+                    base_url=settings.openai_api_url,
+                    api_key=settings.openai_api_key,
+                    model=settings.openai_model_id,
+                )
+            return _call_llama(
+                prepared_messages,
+                temperature=0.2,
+                base_url=settings.llama_server_url,
+            )
         except Exception as exc:  # noqa: BLE001
             console.print(f"[yellow]LLM request failed (attempt {attempt}/3): {exc}[/yellow]")
             if attempt < len(retries):
                 time.sleep(backoff)
 
+    backend_hints = {
+        "llama": "Check that the llama-cpp-python server is running.",
+        "openai": "Check OPENAI_API_URL, OPENAI_API_KEY, and OPENAI_MODEL_ID in .env.",
+        "claude": "Check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, and ANTHROPIC_MODEL_ID in .env.",
+    }
     raise RuntimeError(
-        "LLM request failed after 3 attempts. Please check that the llama-cpp-python "
-        "server is running on port 8000."
+        f"LLM request failed after 3 attempts ({backend} backend). "
+        f"{backend_hints.get(backend, 'Check your LLM configuration.')}"
     )
