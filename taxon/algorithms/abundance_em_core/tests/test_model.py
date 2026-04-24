@@ -15,7 +15,9 @@ import pytest
 
 from taxon.algorithms.abundance_em_core.identifiability import identifiability_report
 from taxon.algorithms.abundance_em_core.mapping_matrix import (
+    _extract_prefix,
     _has_substring_match,
+    _is_valid_taxon_name,
     _normalize_taxon_name,
     _parse_header,
     _should_exclude,
@@ -350,6 +352,38 @@ class TestParseHeader:
         tid, tname = _parse_header("SomeRandomHeader with no pattern")
         assert tname == "unclassified"
 
+    def test_seed_rast_header_rejected(self):
+        """SEED/RAST format headers must not produce false taxa."""
+        hdr = "AK199_peg.906  SEED:fig|6666666.309190.peg.906"
+        _, tname = _parse_header(hdr)
+        assert tname == "unclassified"
+
+    def test_pipe_namespace_blacklist(self):
+        """Known namespace prefixes (seed, fig, peg) before pipe -> unclassified."""
+        hdr = "fig|6666666.12345.peg.1 some description"
+        _, tname = _parse_header(hdr)
+        assert tname == "unclassified"
+
+    def test_species_level_normalization_in_parse(self):
+        hdr = (
+            "sp|P12345|X_ECOLI Something "
+            "OS=Escherichia coli (strain K-12 / MG1655 / ATCC 47076) "
+            "OX=83333 GN=x PE=1 SV=1"
+        )
+        _, tname = _parse_header(hdr, taxon_level="species")
+        assert tname == "Escherichia coli"
+
+    def test_strain_level_keeps_detail(self):
+        hdr = (
+            "sp|P12345|X_ECOLI Something "
+            "OS=Escherichia coli (strain K-12 / MG1655 / ATCC 47076) "
+            "OX=83333 GN=x PE=1 SV=1"
+        )
+        _, tname = _parse_header(hdr, taxon_level="strain")
+        # Parenthetical is stripped in both modes, but strain mode
+        # preserves any sub-species markers outside parens.
+        assert tname == "Escherichia coli"
+
 
 # --------------------------------------------------------------- taxon name normalization
 
@@ -365,6 +399,36 @@ class TestNormalizeTaxonName:
 
     def test_empty(self):
         assert _normalize_taxon_name("") == ""
+
+    def test_subspecies_marker_bv(self):
+        assert _normalize_taxon_name(
+            "Rhizobium leguminosarum bv. viciae 3841", level="species"
+        ) == "Rhizobium leguminosarum"
+
+    def test_subspecies_marker_subsp(self):
+        assert _normalize_taxon_name(
+            "Desulfovibrio vulgaris subsp. vulgaris", level="species"
+        ) == "Desulfovibrio vulgaris"
+
+    def test_binomial_truncation(self):
+        assert _normalize_taxon_name(
+            "Pseudomonas fluorescens ATCC 13525", level="species"
+        ) == "Pseudomonas fluorescens"
+
+    def test_colon_suffix(self):
+        assert _normalize_taxon_name(
+            "Pseudomonas fluorescens ATCC 13525 : Ga0070645_11", level="species"
+        ) == "Pseudomonas fluorescens"
+
+    def test_strain_level_preserves_subspecies(self):
+        assert _normalize_taxon_name(
+            "Rhizobium leguminosarum bv. viciae 3841", level="strain"
+        ) == "Rhizobium leguminosarum bv. viciae 3841"
+
+    def test_strain_level_strips_parens(self):
+        assert _normalize_taxon_name(
+            "Pseudomonas aeruginosa (strain ATCC 15692)", level="strain"
+        ) == "Pseudomonas aeruginosa"
 
 
 # --------------------------------------------------------------- exclude filtering
@@ -435,7 +499,7 @@ class TestBuildMappingMatrixFiltering:
         with tempfile.TemporaryDirectory() as tmpdir:
             fasta = self._write_fasta(tmpdir)
             peptides = ["AGIVDEK", "LDNGGNTTQDNSK"]
-            A, pep_list, taxon_labels = build_mapping_matrix(
+            A, pep_list, taxon_labels, _unclassified = build_mapping_matrix(
                 peptides=peptides,
                 fasta_path=fasta,
                 exclude_prefixes=["DECOY", "contag"],
@@ -450,11 +514,232 @@ class TestBuildMappingMatrixFiltering:
         with tempfile.TemporaryDirectory() as tmpdir:
             fasta = self._write_fasta(tmpdir)
             peptides = ["AGIVDEK"]
-            _, _, taxon_labels = build_mapping_matrix(
+            _, _, taxon_labels, _ = build_mapping_matrix(
                 peptides=peptides, fasta_path=fasta,
             )
-            # Without filtering, decoy and contaminant entries get taxon labels.
-            assert len(taxon_labels) >= 2  # at least the decoy and one real taxon
+            # KP is the only real taxon whose digest includes AGIVDEK.
+            # Decoy/contaminant entries lack parseable organism headers and
+            # are bucketed as unclassified (excluded from the matrix).
+            assert len(taxon_labels) >= 1
+
+
+# --------------------------------------------------------------- taxon name sanity filter
+
+
+class TestIsValidTaxonName:
+    def test_valid_binomial(self):
+        assert _is_valid_taxon_name("Escherichia coli")
+
+    def test_valid_long_code(self):
+        assert _is_valid_taxon_name("AK199Rb")
+
+    def test_rejects_functional_keyword(self):
+        assert not _is_valid_taxon_name("ATP synthase")
+        assert not _is_valid_taxon_name("Hypothetical protein")
+
+    def test_rejects_biochem_abbreviation(self):
+        assert not _is_valid_taxon_name("ATP")
+        assert not _is_valid_taxon_name("NADPH")
+        assert not _is_valid_taxon_name("CoA")
+
+    def test_rejects_short_single_word(self):
+        assert not _is_valid_taxon_name("Mn")
+        assert not _is_valid_taxon_name("pepG")
+
+    def test_rejects_empty(self):
+        assert not _is_valid_taxon_name("")
+        assert not _is_valid_taxon_name("   ")
+
+    def test_accepts_five_char_single_word(self):
+        assert _is_valid_taxon_name("Strep")
+
+    def test_rejects_seed_substring(self):
+        assert not _is_valid_taxon_name("AK199_peg.906 SEED:fig")
+        assert not _is_valid_taxon_name("SEED:fig|6666666.12345")
+
+    def test_rejects_locus_tag(self):
+        assert not _is_valid_taxon_name("CV_peg.67")
+        assert not _is_valid_taxon_name("AK199_peg.906")
+
+    def test_rejects_no_lowercase(self):
+        assert not _is_valid_taxon_name("FIG027190")
+        assert not _is_valid_taxon_name("ATCC 13525")
+
+    def test_rejects_tab_or_pipe(self):
+        assert not _is_valid_taxon_name("Name\twith tab")
+        assert not _is_valid_taxon_name("Name|with pipe")
+
+    def test_rejects_multi_whitespace(self):
+        assert not _is_valid_taxon_name("ORF1  some desc")
+
+
+# --------------------------------------------------------------- prefix extraction
+
+
+class TestExtractPrefix:
+    def test_underscore(self):
+        assert _extract_prefix("CV_peg.67") == "CV"
+
+    def test_no_underscore(self):
+        assert _extract_prefix("bareAcc") == "bareAcc"
+
+    def test_empty(self):
+        assert _extract_prefix("") == ""
+
+
+# --------------------------------------------------------------- prefix cohort inference
+
+
+class TestPrefixCohortInference:
+    """Integration test: entries with no organism annotation are rescued via
+    accession-prefix cohort analysis.
+
+    Example: FASTA with SEED-format headers where ``CV_peg.*`` entries have
+    no organism annotation but a few annotated entries with the same ``CV``
+    prefix exist and vote for *Chromobacterium violaceum*.
+    """
+
+    _FASTA = (
+        # Two annotated entries with prefix "CV" => cohort resolves CV
+        ">CV_anno.1 OS=Chromobacterium violaceum OX=536 GN=x PE=1 SV=1\n"
+        "AGIVDEKRPEPTIDER\n"
+        ">CV_anno.2 OS=Chromobacterium violaceum OX=536 GN=y PE=1 SV=1\n"
+        "ANOTHERPEPTIDEK\n"
+        # Two unannotated entries with prefix "CV" => should be rescued
+        ">CV_peg.67 orf67\n"
+        "AGIVDEKRPEPTIDER\n"
+        ">CV_peg.68 orf68\n"
+        "RESCUEDPEPTIDER\n"
+        # Unannotated entry with unknown prefix => stays unclassified
+        ">ZZUNK_peg.1 orf1\n"
+        "LONELYPEPTIDER\n"
+    )
+
+    def _write_fasta(self, tmpdir):
+        p = os.path.join(tmpdir, "cohort_test.fasta")
+        with open(p, "w") as f:
+            f.write(self._FASTA)
+        return p
+
+    def test_cohort_rescues_unclassified(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = self._write_fasta(tmpdir)
+            peptides = ["AGIVDEK", "RESCUEDPEPTIDER", "LONELYPEPTIDER"]
+            A, pep_list, taxon_labels, unclassified = build_mapping_matrix(
+                peptides=peptides,
+                fasta_path=fasta,
+            )
+            label_names = [lbl.split("|", 1)[1] for lbl in taxon_labels]
+            # CV cohort should produce a single Chromobacterium column.
+            assert "Chromobacterium violaceum" in label_names
+            # No "unclassified" column in the matrix.
+            assert "unclassified" not in label_names
+            # ZZUNK_peg.1's peptide should show up in unclassified list.
+            assert any(pep == "LONELYPEPTIDER" for pep, _acc in unclassified)
+
+    def test_user_prefix_map_overrides(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = self._write_fasta(tmpdir)
+            prefix_tsv = os.path.join(tmpdir, "prefixes.tsv")
+            with open(prefix_tsv, "w") as f:
+                f.write("ZZUNK\tUnknown bacterium strain X\n")
+            peptides = ["AGIVDEK", "LONELYPEPTIDER"]
+            _, _, taxon_labels, unclassified = build_mapping_matrix(
+                peptides=peptides,
+                fasta_path=fasta,
+                prefix_map_file=prefix_tsv,
+            )
+            label_names = [lbl.split("|", 1)[1] for lbl in taxon_labels]
+            assert "Unknown bacterium strain X" in label_names
+            # ZZUNK was rescued by user map so nothing should be unclassified
+            assert not any(pep == "LONELYPEPTIDER" for pep, _acc in unclassified)
+
+    def test_species_level_deduplication(self):
+        """Strain-level OX ids that normalize to the same species should merge."""
+        fasta_content = (
+            # Two strains of Pseudomonas aeruginosa with different OX ids.
+            ">sp|P1|PA1 Prot1 OS=Pseudomonas aeruginosa (strain ATCC 15692) OX=208964 GN=x PE=1 SV=1\n"
+            "AGIVDEKRPEPTIDER\n"
+            ">sp|P2|PA2 Prot2 OS=Pseudomonas aeruginosa (strain PAO1) OX=208963 GN=y PE=1 SV=1\n"
+            "ANOTHERPEPTIDEK\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = os.path.join(tmpdir, "dedup.fasta")
+            with open(fasta, "w") as f:
+                f.write(fasta_content)
+            peptides = ["AGIVDEK", "ANOTHERPEPTIDEK"]
+            _, _, taxon_labels, _ = build_mapping_matrix(
+                peptides=peptides,
+                fasta_path=fasta,
+                taxon_level="species",
+            )
+            label_names = [lbl.split("|", 1)[1] for lbl in taxon_labels]
+            # Both strains should merge into a single "Pseudomonas aeruginosa" column.
+            assert label_names.count("Pseudomonas aeruginosa") == 1
+            assert len(taxon_labels) == 1
+
+    def test_strain_level_preserves_biovars(self):
+        """With taxon_level='strain', sub-species markers outside parens stay distinct."""
+        fasta_content = (
+            # Two biovars of Rhizobium leguminosarum — sub-species marker
+            # outside parentheticals so strain mode preserves the difference.
+            ">sp|P1|RLV1 Prot1 OS=Rhizobium leguminosarum bv. viciae OX=384 GN=x PE=1 SV=1\n"
+            "AGIVDEKRPEPTIDER\n"
+            ">sp|P2|RLT1 Prot2 OS=Rhizobium leguminosarum bv. trifolii OX=382 GN=y PE=1 SV=1\n"
+            "ANOTHERPEPTIDEK\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = os.path.join(tmpdir, "dedup.fasta")
+            with open(fasta, "w") as f:
+                f.write(fasta_content)
+            peptides = ["AGIVDEK", "ANOTHERPEPTIDEK"]
+            _, _, taxon_labels, _ = build_mapping_matrix(
+                peptides=peptides,
+                fasta_path=fasta,
+                taxon_level="strain",
+            )
+            # Strain mode keeps "bv. viciae" vs "bv. trifolii" distinct.
+            assert len(taxon_labels) == 2
+
+    def test_species_level_collapses_biovars(self):
+        """With taxon_level='species', biovars merge into the binomial."""
+        fasta_content = (
+            ">sp|P1|RLV1 Prot1 OS=Rhizobium leguminosarum bv. viciae OX=384 GN=x PE=1 SV=1\n"
+            "AGIVDEKRPEPTIDER\n"
+            ">sp|P2|RLT1 Prot2 OS=Rhizobium leguminosarum bv. trifolii OX=382 GN=y PE=1 SV=1\n"
+            "ANOTHERPEPTIDEK\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = os.path.join(tmpdir, "dedup.fasta")
+            with open(fasta, "w") as f:
+                f.write(fasta_content)
+            peptides = ["AGIVDEK", "ANOTHERPEPTIDEK"]
+            _, _, taxon_labels, _ = build_mapping_matrix(
+                peptides=peptides,
+                fasta_path=fasta,
+                taxon_level="species",
+            )
+            label_names = [lbl.split("|", 1)[1] for lbl in taxon_labels]
+            assert label_names.count("Rhizobium leguminosarum") == 1
+            assert len(taxon_labels) == 1
+
+    def test_sanity_filter_rejects_functional_header(self):
+        """The bracket parser should not treat functional annotations as taxa."""
+        fasta_content = (
+            ">prot1 [ATP synthase subunit alpha]\n"
+            "AGIVDEKRPEPTIDER\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = os.path.join(tmpdir, "func.fasta")
+            with open(fasta, "w") as f:
+                f.write(fasta_content)
+            _, _, taxon_labels, _ = build_mapping_matrix(
+                peptides=["AGIVDEK"],
+                fasta_path=fasta,
+            )
+            label_names = [lbl.split("|", 1)[1] for lbl in taxon_labels]
+            # Should NOT have "ATP synthase subunit alpha" as a taxon
+            assert "ATP synthase subunit alpha" not in label_names
 
 
 # --------------------------------------------------------------- pepXML parser

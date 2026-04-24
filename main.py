@@ -109,6 +109,38 @@ def cli() -> None:
     default=None,
     help="Resolve bare UniProt accession FASTA headers via the UniProt REST API (default: on).",
 )
+@click.option(
+    "--prefix-map",
+    "prefix_map",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="TSV mapping accession prefixes to organism names (two columns, no header).",
+)
+@click.option(
+    "--taxon-level",
+    type=click.Choice(["species", "strain"]),
+    default=None,
+    help="Organism-name normalisation depth: species collapses strains to binomials, strain preserves them.",
+)
+@click.option(
+    "--biomass-mode",
+    type=click.Choice(["correct", "none"]),
+    default="correct",
+    help=(
+        "Biomass correction mode. 'correct' applies per-taxon correction "
+        "factors to convert PSM-level abundance to biomass-level abundance. "
+        "'none' disables correction."
+    ),
+)
+@click.option(
+    "--min-psm-threshold",
+    type=int,
+    default=2,
+    help=(
+        "Minimum PSM count per protein for proteome coverage calculation "
+        "in biomass correction. Default: 2."
+    ),
+)
 def run_cmd(
     input_path: Path,
     database_path: Path,
@@ -117,6 +149,10 @@ def run_cmd(
     detectability_mode: str | None,
     detectability_file: Path | None,
     resolve_uniprot: bool | None,
+    prefix_map: Path | None,
+    taxon_level: str | None,
+    biomass_mode: str,
+    min_psm_threshold: int,
 ) -> None:
     """Start a new run or resume latest if user confirms."""
 
@@ -131,6 +167,12 @@ def run_cmd(
         raise SystemExit(1)
     if resolve_uniprot is not None:
         os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
+    if prefix_map:
+        os.environ["TAXON_PREFIX_MAP_FILE"] = str(prefix_map)
+    if taxon_level:
+        os.environ["TAXON_LEVEL"] = taxon_level
+    os.environ["TAXON_BIOMASS_MODE"] = biomass_mode
+    os.environ["TAXON_MIN_PSM_THRESHOLD"] = str(min_psm_threshold)
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
@@ -247,12 +289,48 @@ def start_server_cmd() -> None:
     default=None,
     help="Resolve bare UniProt accession FASTA headers via the UniProt REST API (default: on).",
 )
+@click.option(
+    "--prefix-map",
+    "prefix_map",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="TSV mapping accession prefixes to organism names (two columns, no header).",
+)
+@click.option(
+    "--taxon-level",
+    type=click.Choice(["species", "strain"]),
+    default=None,
+    help="Organism-name normalisation depth: species collapses strains to binomials, strain preserves them.",
+)
+@click.option(
+    "--biomass-mode",
+    type=click.Choice(["correct", "none"]),
+    default="correct",
+    help=(
+        "Biomass correction mode. 'correct' applies per-taxon correction "
+        "factors to convert PSM-level abundance to biomass-level abundance. "
+        "'none' disables correction."
+    ),
+)
+@click.option(
+    "--min-psm-threshold",
+    type=int,
+    default=2,
+    help=(
+        "Minimum PSM count per protein for proteome coverage calculation "
+        "in biomass correction. Default: 2."
+    ),
+)
 def run_pipeline_cmd(
     input_path: Path,
     database_path: Path,
     detectability_mode: str | None,
     detectability_file: Path | None,
     resolve_uniprot: bool | None,
+    prefix_map: Path | None,
+    taxon_level: str | None,
+    biomass_mode: str,
+    min_psm_threshold: int,
 ) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
@@ -266,6 +344,12 @@ def run_pipeline_cmd(
         raise SystemExit(1)
     if resolve_uniprot is not None:
         os.environ["TAXON_RESOLVE_UNIPROT"] = "true" if resolve_uniprot else "false"
+    if prefix_map:
+        os.environ["TAXON_PREFIX_MAP_FILE"] = str(prefix_map)
+    if taxon_level:
+        os.environ["TAXON_LEVEL"] = taxon_level
+    os.environ["TAXON_BIOMASS_MODE"] = biomass_mode
+    os.environ["TAXON_MIN_PSM_THRESHOLD"] = str(min_psm_threshold)
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)

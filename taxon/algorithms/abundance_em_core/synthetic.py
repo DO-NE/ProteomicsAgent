@@ -405,3 +405,341 @@ def run_detectability_validation(seed: int = 42) -> dict:
         "uniform_pi": model_uniform.pi_.copy(),
         "true_pi": true_pi.copy(),
     }
+
+
+# -- Biomass-correction validation -----------------------------------------
+
+
+# Standard 20-AA alphabet. Uniform sampling over this set yields
+# frequency(K) = frequency(R) = 1/20 = 5%, i.e. a combined tryptic
+# cleavage-site rate of ~10%, matching the realistic target.
+_AA_ALPHABET = np.array(list("ACDEFGHIKLMNPQRSTVWY"), dtype="<U1")
+_BIOMASS_MIN_PEPTIDE_LEN = 7
+_BIOMASS_MAX_PEPTIDE_LEN = 50
+
+
+def _digest_random_proteome(
+    n_proteins: int,
+    avg_protein_length: int,
+    rng: np.random.Generator,
+) -> tuple:
+    """Sample a random proteome and return ``(unique_peptides, total_aa)``.
+
+    A simple trypsin rule is used: peptides end immediately after every
+    ``K`` or ``R``, and the final protein-terminal fragment is also
+    emitted. Only peptides in
+    ``[_BIOMASS_MIN_PEPTIDE_LEN, _BIOMASS_MAX_PEPTIDE_LEN]`` are kept.
+    """
+    total_aa = int(n_proteins * avg_protein_length)
+    if total_aa == 0:
+        return set(), 0
+
+    # Draw the entire proteome in one call and slice into proteins.
+    codes = rng.integers(0, _AA_ALPHABET.shape[0], size=total_aa, dtype=np.int64)
+    chars = _AA_ALPHABET[codes].reshape(n_proteins, avg_protein_length)
+
+    peptide_set: set = set()
+    for i in range(n_proteins):
+        row = chars[i]
+        # Vectorised cut-site lookup; the " + 1" pushes the boundary to the
+        # index AFTER each K/R so that the K/R itself is the last residue
+        # of the peptide it terminates.
+        is_cut = (row == "K") | (row == "R")
+        cut_positions = np.nonzero(is_cut)[0] + 1
+        seq = "".join(row.tolist())
+        start = 0
+        for end in cut_positions:
+            length = int(end) - start
+            if _BIOMASS_MIN_PEPTIDE_LEN <= length <= _BIOMASS_MAX_PEPTIDE_LEN:
+                peptide_set.add(seq[start:int(end)])
+            start = int(end)
+        # Trailing fragment (protein C-terminus without a final K/R).
+        tail_length = avg_protein_length - start
+        if _BIOMASS_MIN_PEPTIDE_LEN <= tail_length <= _BIOMASS_MAX_PEPTIDE_LEN:
+            peptide_set.add(seq[start:])
+
+    return peptide_set, total_aa
+
+
+def generate_biomass_correction_test(
+    n_taxa: int = 4,
+    proteome_sizes: Optional[list] = None,
+    avg_protein_lengths: Optional[list] = None,
+    true_biomass: Optional[np.ndarray] = None,
+    total_psms: int = 10000,
+    shared_fraction: float = 0.15,
+    seed: int = 42,
+) -> dict:
+    """Generate a synthetic community with taxon-specific PSM yield.
+
+    Mimics a bacteria-to-eukaryote range by giving each taxon a different
+    proteome size and average protein length. The per-taxon tryptic-yield
+    factor ``g_t^(length) = n_tryptic / total_aa`` is computed empirically
+    from the generated proteome, and expected PSM shares are drawn
+    proportional to ``true_biomass[t] * g_t``. A model fit without
+    corrections therefore recovers ``true_psm_proportions``, while a model
+    fit with ``biomass_corrections=g_t`` recovers ``true_biomass``.
+
+    Parameters
+    ----------
+    n_taxa : int, optional
+        Number of taxa (default ``4``).
+    proteome_sizes : list of int or None, optional
+        Number of proteins per taxon. Defaults to
+        ``[500, 2000, 5000, 14000]``.
+    avg_protein_lengths : list of int or None, optional
+        Average protein length (aa) per taxon. Defaults to
+        ``[280, 300, 320, 420]``.
+    true_biomass : np.ndarray or None, optional
+        Ground-truth biomass proportions. Defaults to equal biomass
+        (``[0.25, 0.25, 0.25, 0.25]`` when ``n_taxa == 4``).
+    total_psms : int, optional
+        Total spectral counts to simulate (default ``10000``).
+    shared_fraction : float, optional
+        Fraction of each taxon's peptides to promote to shared status by
+        copying them to one other random taxon (default ``0.15``).
+    seed : int, optional
+        Random seed (default ``42``).
+
+    Returns
+    -------
+    dict
+        Keys: ``A``, ``y``, ``true_biomass``, ``true_psm_proportions``,
+        ``g_t``, ``peptide_list``, ``taxon_labels``, ``proteome_sizes``,
+        ``avg_protein_lengths``.
+    """
+    if proteome_sizes is None:
+        proteome_sizes = [500, 2000, 5000, 14000]
+    if avg_protein_lengths is None:
+        avg_protein_lengths = [280, 300, 320, 420]
+    if true_biomass is None:
+        true_biomass = np.full(n_taxa, 1.0 / n_taxa)
+
+    proteome_sizes = list(proteome_sizes)
+    avg_protein_lengths = list(avg_protein_lengths)
+
+    if len(proteome_sizes) != n_taxa:
+        raise ValueError(
+            f"proteome_sizes must have length {n_taxa}, got {len(proteome_sizes)}"
+        )
+    if len(avg_protein_lengths) != n_taxa:
+        raise ValueError(
+            f"avg_protein_lengths must have length {n_taxa}, got "
+            f"{len(avg_protein_lengths)}"
+        )
+    if not 0.0 <= shared_fraction <= 1.0:
+        raise ValueError("shared_fraction must lie in [0, 1]")
+
+    true_biomass = np.asarray(true_biomass, dtype=np.float64)
+    if true_biomass.shape != (n_taxa,):
+        raise ValueError(f"true_biomass must have shape ({n_taxa},)")
+    if not np.isclose(true_biomass.sum(), 1.0):
+        true_biomass = true_biomass / true_biomass.sum()
+
+    rng = np.random.default_rng(seed)
+
+    # Step (a)-(c): generate proteomes, digest, compute g_length.
+    taxon_peptide_sets: list = []
+    total_aa: list = []
+    for t in range(n_taxa):
+        pep_set, aa_count = _digest_random_proteome(
+            n_proteins=proteome_sizes[t],
+            avg_protein_length=avg_protein_lengths[t],
+            rng=rng,
+        )
+        taxon_peptide_sets.append(pep_set)
+        total_aa.append(aa_count)
+
+    g_t = np.array(
+        [
+            (len(taxon_peptide_sets[t]) / total_aa[t]) if total_aa[t] > 0 else 0.0
+            for t in range(n_taxa)
+        ],
+        dtype=np.float64,
+    )
+    if (g_t <= 0).any():
+        raise RuntimeError(
+            "At least one synthetic taxon produced no detectable peptides; "
+            "increase the proteome size or protein length."
+        )
+
+    # Seed the peptide-to-taxa map with origin memberships.
+    peptide_to_taxa: dict = {}
+    for t in range(n_taxa):
+        for pep in taxon_peptide_sets[t]:
+            peptide_to_taxa.setdefault(pep, set()).add(t)
+
+    # Step (d): cross-contaminate by copying a fraction of each taxon's
+    # peptides onto a random other taxon.
+    if n_taxa > 1:
+        for t in range(n_taxa):
+            peps = list(taxon_peptide_sets[t])
+            n_share = int(round(shared_fraction * len(peps)))
+            if n_share <= 0:
+                continue
+            idx = rng.choice(len(peps), size=n_share, replace=False)
+            others_template = [u for u in range(n_taxa) if u != t]
+            for k in idx:
+                pep = peps[int(k)]
+                other = int(rng.choice(others_template))
+                peptide_to_taxa[pep].add(other)
+
+    # Step (f): build the binary peptide-taxon matrix. Sorting keeps the
+    # row order deterministic across runs at the same seed.
+    peptide_list = sorted(peptide_to_taxa.keys())
+    P = len(peptide_list)
+    A = np.zeros((P, n_taxa), dtype=np.int8)
+    for i, pep in enumerate(peptide_list):
+        for t in peptide_to_taxa[pep]:
+            A[i, t] = 1
+
+    # Step (e): expected PSM proportions are proportional to biomass * g.
+    psm_num = true_biomass * g_t
+    psm_sum = float(psm_num.sum())
+    if psm_sum <= 0:
+        raise RuntimeError("biomass * g_t is identically zero; cannot sample.")
+    true_psm_proportions = psm_num / psm_sum
+
+    # Step (g): sample y from Multinomial(total_psms, phi), where phi is
+    # built by distributing each taxon's PSM share uniformly across its
+    # peptides (post-sharing). phi_p = sum_t (psm_prop[t] * A[p,t] / n_t[t]).
+    n_t = A.sum(axis=0).astype(np.float64)
+    if (n_t == 0).any():
+        raise RuntimeError("A synthetic taxon has no peptides after sharing.")
+    M = A.astype(np.float64) / n_t[np.newaxis, :]
+    phi = M @ true_psm_proportions
+    phi_total = float(phi.sum())
+    if phi_total <= 0:
+        raise RuntimeError("phi vector is identically zero; cannot sample.")
+    phi = phi / phi_total
+    y = rng.multinomial(total_psms, phi)
+
+    taxon_labels = [f"taxon_{i}" for i in range(n_taxa)]
+
+    return {
+        "A": A,
+        "y": y,
+        "true_biomass": true_biomass,
+        "true_psm_proportions": true_psm_proportions,
+        "g_t": g_t,
+        "peptide_list": peptide_list,
+        "taxon_labels": taxon_labels,
+        "proteome_sizes": proteome_sizes,
+        "avg_protein_lengths": avg_protein_lengths,
+    }
+
+
+def run_biomass_correction_validation(seed: int = 42) -> dict:
+    """Run a comparative validation of biomass-corrected vs uncorrected EM.
+
+    Generates a synthetic community in which taxa have markedly different
+    proteome sizes and protein lengths. Fits two models on the same data:
+    one without corrections (should recover ``true_psm_proportions``) and
+    one with ``biomass_corrections=g_t`` (should recover ``true_biomass``).
+    Prints a per-taxon comparison table and returns both recovery metric
+    dicts.
+
+    Returns
+    -------
+    dict
+        Keys: ``uncorrected_metrics``, ``corrected_metrics``,
+        ``uncorrected_pi``, ``corrected_pi``, ``true_biomass``,
+        ``true_psm_proportions``, ``g_t``.
+    """
+    from .model import AbundanceEM
+
+    data = generate_biomass_correction_test(seed=seed)
+    true_biomass = data["true_biomass"]
+    true_psm = data["true_psm_proportions"]
+    g_t = data["g_t"]
+    taxon_names = data["taxon_labels"]
+    A = data["A"]
+    y = data["y"]
+
+    model_uncorr = AbundanceEM(
+        alpha=0.5, max_iter=500, tol=1e-8, seed=0,
+    )
+    model_uncorr.fit(A, y)
+
+    model_corr = AbundanceEM(
+        alpha=0.5, max_iter=500, tol=1e-8, seed=0,
+        biomass_corrections=g_t,
+    )
+    model_corr.fit(A, y)
+
+    # Uncorrected pi should match the PSM simplex; corrected pi should
+    # match the biomass simplex.
+    uncorrected_metrics = evaluate_recovery(
+        true_psm, model_uncorr.pi_, taxon_names=taxon_names,
+    )
+    corrected_metrics = evaluate_recovery(
+        true_biomass, model_corr.pi_, taxon_names=taxon_names,
+    )
+
+    header = (
+        f"{'Taxon':<10} {'TrueBio':>10} {'TruePSM':>10} "
+        f"{'Uncorr':>10} {'Corr':>10} "
+        f"{'Err(Unc)':>12} {'Err(Cor)':>12}"
+    )
+    divider = "=" * len(header)
+    sub = "-" * len(header)
+
+    print("\n" + divider)
+    print("  Biomass Correction Validation")
+    print(divider)
+    print(header)
+    print(sub)
+    for i, name in enumerate(taxon_names):
+        err_u = abs(float(model_uncorr.pi_[i]) - float(true_psm[i]))
+        err_c = abs(float(model_corr.pi_[i]) - float(true_biomass[i]))
+        print(
+            f"{name:<10} "
+            f"{true_biomass[i]:>10.4f} "
+            f"{true_psm[i]:>10.4f} "
+            f"{model_uncorr.pi_[i]:>10.4f} "
+            f"{model_corr.pi_[i]:>10.4f} "
+            f"{err_u:>12.4f} "
+            f"{err_c:>12.4f}"
+        )
+    print(sub)
+    print(
+        f"{'L1 total':<10} "
+        f"{'':>10} {'':>10} "
+        f"{uncorrected_metrics['l1_error']:>10.4f} "
+        f"{corrected_metrics['l1_error']:>10.4f}"
+    )
+    print(
+        f"{'Cosine':<10} "
+        f"{'':>10} {'':>10} "
+        f"{uncorrected_metrics['cosine_similarity']:>10.4f} "
+        f"{corrected_metrics['cosine_similarity']:>10.4f}"
+    )
+    print(
+        f"{'KL div':<10} "
+        f"{'':>10} {'':>10} "
+        f"{uncorrected_metrics['kl_divergence']:>10.4f} "
+        f"{corrected_metrics['kl_divergence']:>10.4f}"
+    )
+    print(divider)
+    print(
+        "\nInterpretation:"
+        "\n  Uncorrected pi is expected to match True PSM%."
+        "\n  Corrected pi is expected to match True Biomass."
+    )
+    print(
+        f"  Uncorrected -> true_psm  L1 error : {uncorrected_metrics['l1_error']:.4f}"
+    )
+    print(
+        f"  Corrected   -> true_bio  L1 error : {corrected_metrics['l1_error']:.4f}"
+    )
+    print()
+
+    return {
+        "uncorrected_metrics": uncorrected_metrics,
+        "corrected_metrics": corrected_metrics,
+        "uncorrected_pi": model_uncorr.pi_.copy(),
+        "corrected_pi": model_corr.pi_.copy(),
+        "true_biomass": true_biomass.copy(),
+        "true_psm_proportions": true_psm.copy(),
+        "g_t": g_t.copy(),
+    }

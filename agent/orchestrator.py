@@ -309,6 +309,7 @@ class Orchestrator:
             "fasta_path": params.get("fasta_path", self.state.database_path),
             "database_path": params.get("database_path", self.state.database_path),
             "spectral_counts": spectral_counts,
+            "pepxml_path": pepxml_path,
         }
 
         detectability_mode = params.get("detectability_mode") or os.getenv("TAXON_DETECTABILITY_MODE")
@@ -322,6 +323,13 @@ class Orchestrator:
             config["resolve_uniprot"] = bool(params["resolve_uniprot"])
         elif resolve_uniprot_env is not None:
             config["resolve_uniprot"] = resolve_uniprot_env.lower() not in ("0", "false", "no")
+        prefix_map_file = params.get("prefix_map_file") or os.getenv("TAXON_PREFIX_MAP_FILE")
+        if prefix_map_file:
+            config["prefix_map_file"] = prefix_map_file
+        taxon_level = params.get("taxon_level") or os.getenv("TAXON_LEVEL")
+        if taxon_level:
+            config["taxon_level"] = taxon_level
+        config["output_dir"] = str(self.run_dir)
 
         results = self.taxon_registry.run(algorithm, peptides, config)
         self.latest_taxon_results = results
