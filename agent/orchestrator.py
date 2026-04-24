@@ -331,13 +331,21 @@ class Orchestrator:
             config["taxon_level"] = taxon_level
         config["output_dir"] = str(self.run_dir)
 
+        # Forward any additional plugin-specific params (e.g. method, top_n).
+        for k, v in params.items():
+            if k not in config:
+                config[k] = v
+
         results = self.taxon_registry.run(algorithm, peptides, config)
         self.latest_taxon_results = results
         self.state.taxon_algorithm = algorithm
         self.state_manager.save(self.state)
 
         taxon_dir = self.run_dir / "taxon"
-        tsv_path = export_tsv(results, taxon_dir, "results.tsv")
+        method = params.get("method", "")
+        default_filename = f"{algorithm}_{method}.tsv" if method else f"{algorithm}.tsv"
+        filename = params.get("output_filename", default_filename)
+        tsv_path = export_tsv(results, taxon_dir, filename)
 
         # mark complete so resume works
         self.state_manager.mark_stage_complete("taxon_inference", str(tsv_path))

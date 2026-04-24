@@ -114,7 +114,12 @@ def check_tools(settings: Settings | None = None) -> dict[str, bool]:
     status: dict[str, bool] = {}
     for tool, raw_path in tool_paths.items():
         path = Path(raw_path).expanduser() if raw_path else Path("")
-        ok = _is_executable(path) if raw_path else False
+        if not raw_path:
+            ok = False
+        elif path.suffix == ".jar":
+            ok = path.exists() and path.is_file()
+        else:
+            ok = _is_executable(path)
         status[tool] = ok
         table.add_row(tool, str(path) if raw_path else "(not configured)", "✓ found" if ok else "✗ missing")
 
