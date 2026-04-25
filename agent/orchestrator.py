@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
-import re
 import uuid
 from pathlib import Path
 
@@ -68,6 +68,17 @@ class Orchestrator:
             self.state.autonomy_mode = input("Select autonomy mode (full/balanced/supervised): ").strip().lower() or "balanced"
             self.state_manager.save(self.state)
 
+        self.log_path = self.run_dir / "chat.log"
+        self._turn = 0
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.log_path.open("a", encoding="utf-8") as _f:
+            _f.write(
+                f"\n{'═' * 80}\n"
+                f"SESSION STARTED: {ts} | Run ID: {self.state.run_id} | Backend: {settings.llm_backend}\n"
+                f"{'═' * 80}\n"
+            )
+
         self.stages = {
             "format_conversion": FormatConversion(),
             "peptide_id": PeptideIdentification(),
@@ -76,7 +87,7 @@ class Orchestrator:
             "protein_assignment": ProteinAssignment(),
         }
         self.taxon_registry = TaxonRegistry()
-        self.history: list[dict[str, str]] = []
+        self.history: list[dict] = []
         self.latest_taxon_results: list[TaxonResult] = []
         self.latest_figures: list[str] = []
 
@@ -104,45 +115,58 @@ class Orchestrator:
             completed_stages=", ".join(self.state.completed_stages),
         )
 
-    def _parse_action(self, response: str) -> dict | None:
-        """Extract action dictionary from LLM ACTION block."""
+    def _log_event(self, label: str, content: str) -> None:
+        """Append a labelled, timestamped event block to the chat log file."""
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sep = "─" * 80
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n{sep}\n[{ts}] {label}\n{sep}\n{content}\n")
 
-        match = re.search(r"<ACTION>(.*?)</ACTION>", response, flags=re.DOTALL)
-        if not match:
-            return None
-        block = match.group(1)
-        action: dict[str, object] = {}
-        for line in block.splitlines():
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if key == "params":
-                action[key] = json.loads(value) if value else {}
-            else:
-                action[key] = value
-        return action
-
-    def _approve_action(self, tool: str, stage: str | None, params: dict) -> tuple[bool, dict]:
-        """Apply autonomy mode gating and optionally allow param edits."""
+    def _approve_action(self, tool_name: str, tool_input: dict) -> tuple[bool, dict]:
+        """Apply autonomy mode gating and optionally allow full input edits."""
 
         mode = self.state.autonomy_mode
-        should_prompt = mode == "supervised" or (mode == "balanced" and tool == "run_pipeline_stage")
+        should_prompt = mode == "supervised" or (
+            mode == "balanced" and tool_name == "run_pipeline_stage"
+        )
         if not should_prompt:
-            return True, params
+            return True, tool_input
 
-        self.console.print(f"[cyan]Proposed action:[/cyan] tool={tool}, stage={stage}, params={params}")
+        self.console.print(
+            f"[cyan]Proposed tool call:[/cyan] {tool_name}({json.dumps(tool_input)})"
+        )
         answer = input("Proceed? (y/n/edit): ").strip().lower()
         if answer == "y":
-            return True, params
+            return True, tool_input
         if answer == "edit":
-            raw = input("Enter new params JSON: ").strip()
+            raw = input("Enter new tool input JSON: ").strip()
             try:
                 return True, json.loads(raw)
             except json.JSONDecodeError:
-                return False, params
-        return False, params
+                return False, tool_input
+        return False, tool_input
+
+    def _dispatch_tool(self, tool_name: str, tool_input: dict) -> dict:
+        """Execute a named tool with its input and return the result dict."""
+
+        if tool_name == "run_pipeline_stage":
+            return self.run_pipeline_stage(
+                str(tool_input.get("stage", "")),
+                tool_input.get("params") or {},
+            )
+        if tool_name == "run_taxon_inference":
+            algorithm = str(tool_input.get("algorithm", self.state.taxon_algorithm))
+            return self.run_taxon_inference(algorithm, tool_input)
+        if tool_name == "show_state":
+            return self.show_state()
+        if tool_name == "generate_figures":
+            return self.generate_figures(
+                list(tool_input.get("types", [])),
+                str(tool_input.get("data_path", "")),
+            )
+        if tool_name == "export_report":
+            return self.export_report(str(tool_input.get("format", "txt")))
+        return {"status": "error", "message": f"Unknown tool: {tool_name}"}
 
     def run_pipeline_stage(self, stage: str, params: dict) -> dict:
         """Execute a pipeline stage and update persisted state."""
@@ -175,6 +199,7 @@ class Orchestrator:
             "database_path": self.state.database_path,
             "msfragger_path": self.settings.msfragger_path,
             "comet_path": self.settings.comet_path,
+            "comet_params_path": self.settings.comet_params_path,
             "tpp_bin_path": self.settings.tpp_bin_path,
             "percolator_path": self.settings.percolator_path,
         }
@@ -303,30 +328,103 @@ class Orchestrator:
         path = export_summary(self.state, self.latest_taxon_results, self.latest_figures, report_dir)
         return {"status": "ok", "path": path}
 
-    def _execute_action(self, action: dict) -> dict:
-        """Dispatch action to tool method."""
+    _OTHER_SENTINEL = "__other__"
 
-        tool = str(action.get("tool", ""))
-        stage = action.get("stage")
-        params = action.get("params", {})
-        if not isinstance(params, dict):
-            params = {}
+    def ask_question(self, params: dict) -> dict:
+        """Present an interactive question with arrow-key navigation."""
 
-        approved, params = self._approve_action(tool, str(stage) if stage else None, params)
-        if not approved:
-            return {"status": "cancelled", "message": "Action cancelled by user."}
+        import questionary
+        from questionary import Choice, Style
 
-        if tool == "run_pipeline_stage":
-            return self.run_pipeline_stage(str(stage), params)
-        if tool == "run_taxon_inference":
-            return self.run_taxon_inference(str(params.get("algorithm", self.state.taxon_algorithm)), params)
-        if tool == "show_state":
-            return self.show_state()
-        if tool == "generate_figures":
-            return self.generate_figures(list(params.get("types", [])), str(params.get("data_path", "")))
-        if tool == "export_report":
-            return self.export_report(str(params.get("format", "txt")))
-        return {"status": "error", "message": f"Unknown tool: {tool}"}
+        question = str(params.get("question", "What would you like to do?"))
+        q_type = str(params.get("type", "decision"))
+        options = params.get("options", [])
+        if not isinstance(options, list):
+            options = []
+
+        type_labels = {
+            "clarification": "Clarification Needed",
+            "decision": "Decision",
+            "parameter": "Parameter Input",
+        }
+        type_label = type_labels.get(q_type, q_type.title())
+
+        style = Style([
+            ("qmark", "fg:cyan bold"),
+            ("question", "bold"),
+            ("answer", "fg:green bold"),
+            ("pointer", "fg:cyan bold"),
+            ("highlighted", "fg:cyan bold"),
+            ("selected", "fg:green"),
+        ])
+
+        # Build questionary choices
+        choices: list[Choice] = []
+        for opt in options:
+            if isinstance(opt, str):
+                label, desc = opt, ""
+            else:
+                label = opt.get("label", "")
+                desc = opt.get("description", "")
+            title = f"{label} — {desc}" if desc else label
+            choices.append(Choice(title=title, value=label))
+        choices.append(Choice(
+            title="Other (type your own response)",
+            value=self._OTHER_SENTINEL,
+        ))
+
+        # Show context panel
+        self.console.print(Panel(
+            f"[bold]{question}[/bold]",
+            title=type_label,
+            border_style="cyan",
+        ))
+
+        # Selection loop — user can go back from "Other" to the option list
+        while True:
+            selected = questionary.select(
+                "Select an option:",
+                choices=choices,
+                style=style,
+                instruction="(arrow keys to move, enter to select)",
+            ).ask()
+
+            if selected is None:
+                # User pressed Ctrl-C — treat as cancel
+                return {"status": "cancelled", "message": "Question cancelled by user."}
+
+            if selected != self._OTHER_SENTINEL:
+                self.console.print(f"\n  [green]Selected:[/green] {selected}\n")
+                return {"status": "ok", "answer": selected, "type": q_type}
+
+            # "Other" selected — prompt for free text
+            custom = questionary.text(
+                "Your response:",
+                style=style,
+            ).ask()
+
+            if custom is None or not custom.strip():
+                # Ctrl-C or empty — go back to option list
+                self.console.print("[dim]  Going back to options...[/dim]\n")
+                continue
+
+            custom = custom.strip()
+
+            # Confirm or go back
+            confirm = questionary.confirm(
+                f'Send "{custom}"?',
+                default=True,
+                style=style,
+            ).ask()
+
+            if confirm:
+                self.console.print(f"\n  [green]Selected:[/green] {custom}\n")
+                return {"status": "ok", "answer": custom, "type": q_type}
+
+            # User declined — back to option list
+            self.console.print("[dim]  Going back to options...[/dim]\n")
+            continue
+
 
     # Ordered pipeline stages for no-LLM automatic execution.
     PIPELINE_STAGES = [
@@ -384,7 +482,7 @@ class Orchestrator:
                     break
 
     def run(self) -> None:
-        """Start interactive conversation loop and process LLM-directed actions."""
+        """Start interactive conversation loop and process LLM-directed tool calls."""
 
         if self.settings.no_llm_mode:
             self._run_no_llm()
@@ -392,20 +490,80 @@ class Orchestrator:
 
         self.console.print("[green]Type 'exit' or 'quit' to end the session.[/green]")
         while True:
+            # ── Outer loop: wait for user input ──────────────────────────────
             user_text = input("> ").strip()
             if user_text.lower() in {"exit", "quit"}:
                 self.console.print("[green]Session ended.[/green]")
                 break
 
+            self._turn += 1
             self.history.append({"role": "user", "content": user_text})
-            system_prompt = self._build_system_prompt()
-            response = llm_client.chat(self.history, system_prompt)
-            self.console.print(Markdown(response))
-            self.history.append({"role": "assistant", "content": response})
+            self._log_event(f"TURN {self._turn} — USER MESSAGE", user_text)
 
-            action = self._parse_action(response)
-            if action:
-                result = self._execute_action(action)
-                tool_msg = f"Tool result: {json.dumps(result, indent=2)}"
-                self.console.print(Panel(tool_msg, title="Action Result"))
-                self.history.append({"role": "assistant", "content": tool_msg})
+            # ── Inner agentic loop: keep querying until no tool call ──────────
+            while True:
+                system_prompt = self._build_system_prompt()
+                self._log_event(f"TURN {self._turn} — SYSTEM PROMPT", system_prompt)
+                self._log_event(
+                    f"TURN {self._turn} — CONVERSATION HISTORY (sent to LLM)",
+                    json.dumps(self.history, indent=2, ensure_ascii=False),
+                )
+
+                response = llm_client.chat(self.history, system_prompt, self.settings)
+
+                if response.text:
+                    self.console.print(Markdown(response.text))
+                    self._log_event(f"TURN {self._turn} — LLM RESPONSE (text)", response.text)
+
+                if response.tool_call is None:
+                    # Pure text reply — add to history and hand control back to user.
+                    if response.text:
+                        self.history.append({"role": "assistant", "content": response.text})
+                    break
+
+                tool_call = response.tool_call
+                tool_name = tool_call["name"]
+                tool_input = tool_call["input"]
+
+                self._log_event(
+                    f"TURN {self._turn} — TOOL CALL [PRE-EXECUTE]",
+                    json.dumps(tool_call, indent=2, ensure_ascii=False),
+                )
+
+                # Record the assistant turn (text + tool_use) in history.
+                self.history.append(
+                    {"role": "assistant_with_tool", "text": response.text, "tool_call": tool_call}
+                )
+
+                # ask_question skips the approval gate — it *is* asking the user.
+                if tool_name == "ask_question":
+                    result = self.ask_question(tool_input)
+                else:
+                    approved, tool_input = self._approve_action(tool_name, tool_input)
+                    if not approved:
+                        result = {"status": "cancelled", "message": "Action cancelled by user."}
+                    else:
+                        result = self._dispatch_tool(tool_name, tool_input)
+                    self.console.print(
+                        Panel(json.dumps(result, indent=2), title=f"Tool Result: {tool_name}")
+                    )
+
+                self._log_event(
+                    f"TURN {self._turn} — TOOL RESULT",
+                    json.dumps(result, indent=2, ensure_ascii=False),
+                )
+
+                # Append the tool result so the LLM sees it on the next inner iteration.
+                self.history.append(
+                    {
+                        "role": "tool_result",
+                        "tool_use_id": tool_call["id"],
+                        "content": json.dumps(result),
+                    }
+                )
+
+                # If ask_question was cancelled, stop the inner loop and let the user type.
+                if tool_name == "ask_question" and result.get("status") != "ok":
+                    self.console.print("[dim]Question cancelled.[/dim]")
+                    break
+                # Otherwise continue the inner loop — the LLM reacts to the result.
