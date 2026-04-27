@@ -250,6 +250,16 @@ class Orchestrator:
         taxon_level = params.get("taxon_level") or os.getenv("TAXON_LEVEL")
         if taxon_level:
             config["taxon_level"] = taxon_level
+        marker_env = os.getenv("TAXON_MARKER_CORRECTION")
+        if "marker_correction" in params:
+            config["marker_correction"] = bool(params["marker_correction"])
+        elif marker_env is not None:
+            config["marker_correction"] = marker_env.lower() not in ("0", "false", "no")
+        hmm_profile_dir = (
+            params.get("hmm_profile_dir") or os.getenv("TAXON_HMM_PROFILE_DIR")
+        )
+        if hmm_profile_dir:
+            config["hmm_profile_dir"] = hmm_profile_dir
         config["output_dir"] = str(self.run_dir)
 
         results = self.taxon_registry.run(algorithm, peptides, config)

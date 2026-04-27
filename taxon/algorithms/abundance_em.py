@@ -164,7 +164,7 @@ class AbundanceEMPlugin(TaxonPlugin):
             return []
 
         # Build the mapping matrix.
-        A, peptide_list, taxon_labels, unclassified_peptides = build_mapping_matrix(
+        mapping_result = build_mapping_matrix(
             peptides=peptides,
             fasta_path=fasta_path,
             enzyme=enzyme,
@@ -177,6 +177,10 @@ class AbundanceEMPlugin(TaxonPlugin):
             prefix_map_file=str(prefix_map_file) if prefix_map_file else None,
             taxon_level=taxon_level,
         )
+        A = mapping_result.matrix
+        peptide_list = mapping_result.peptide_list
+        taxon_labels = mapping_result.taxon_labels
+        unclassified_peptides = mapping_result.unclassified_peptides
 
         # Write unclassified entries to a diagnostic TSV.
         if unclassified_peptides and output_dir:
@@ -290,6 +294,16 @@ class AbundanceEMPlugin(TaxonPlugin):
             model.log_posterior_history_[-1] if model.log_posterior_history_ else float("nan"),
         )
 
+        # --- Marker-based cell-equivalent correction (Cycle 5, opt-in) ---
+        marker_result = None
+        if config.get("marker_correction", False):
+            marker_result = self._run_marker_correction(
+                model=model,
+                mapping_result=mapping_result,
+                spectral_counts=spectral_counts,
+                config=config,
+            )
+
         # Convert to TaxonResult objects.
         results: list = []
         confidences = self._confidences(model.standard_errors_)
@@ -318,6 +332,16 @@ class AbundanceEMPlugin(TaxonPlugin):
             )
 
         results.sort(key=lambda r: r.abundance, reverse=True)
+
+        # If marker correction was requested, persist its outputs alongside
+        # the main results so downstream tooling can compare PSM-level pi
+        # vs cell-equivalent c.  The TaxonResult records returned to the
+        # caller still carry pi as the abundance — c is reported through
+        # the auxiliary TSV / report files only, to avoid silently
+        # changing the meaning of TaxonResult.abundance.
+        if marker_result is not None and output_dir:
+            self._write_marker_outputs(marker_result, output_dir)
+
         return results
 
     # ----------------------------------------------------------------- helpers
@@ -347,3 +371,107 @@ class AbundanceEMPlugin(TaxonPlugin):
         if standard_errors is None:
             return np.zeros(0)
         return np.clip(1.0 - 2.0 * standard_errors, 0.0, 1.0)
+
+    # ----------------------------------------------------- marker correction
+
+    @staticmethod
+    def _run_marker_correction(model, mapping_result, spectral_counts, config):
+        """Run hmmsearch + cell-equivalent correction.
+
+        Returns a :class:`MarkerCorrectionResult`, or ``None`` if the
+        prerequisites (HMM profile dir, hmmsearch binary, marker hits)
+        are unmet — failures are logged at WARNING and never raise.
+        """
+        from .abundance_em_core.hmm_marker_search import run_hmmsearch
+        from .abundance_em_core.marker_correction import (
+            compute_cell_equivalent_abundance,
+            log_marker_diagnostics,
+        )
+
+        hmm_profile_dir = config.get("hmm_profile_dir")
+        if not hmm_profile_dir:
+            logger.warning(
+                "marker_correction enabled but hmm_profile_dir not set; "
+                "skipping cell-equivalent correction"
+            )
+            return None
+
+        try:
+            marker_search = run_hmmsearch(
+                fasta_path=str(config["fasta_path"]),
+                hmm_profile_dir=str(hmm_profile_dir),
+                evalue_threshold=float(config.get("marker_evalue", 1e-10)),
+                cache_dir=str(config["output_dir"])
+                if config.get("output_dir") else None,
+                taxon_protein_peptides=mapping_result.taxon_protein_peptides,
+                cpu=config.get("hmmsearch_cpu"),
+            )
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.warning("marker correction skipped: %s", exc)
+            return None
+
+        if not marker_search.marker_proteins:
+            logger.warning(
+                "hmmsearch returned no marker hits; skipping cell-equivalent "
+                "correction"
+            )
+            return None
+
+        # Spectral-count dict used by marker correction must align with
+        # the y vector the EM saw.  Re-key by row order in case the
+        # caller-supplied dict is out-of-sync (e.g. spectra without an
+        # entry default to 0, which is what we want).
+        sc_for_marker = dict(spectral_counts) if spectral_counts else {}
+        if not sc_for_marker:
+            sc_for_marker = {p: 1 for p in mapping_result.peptide_list}
+
+        result = compute_cell_equivalent_abundance(
+            pi=model.pi_,
+            responsibilities=model.responsibilities_,
+            spectral_counts=sc_for_marker,
+            mapping_matrix=mapping_result.matrix,
+            taxon_labels=mapping_result.taxon_labels,
+            peptide_index=mapping_result.peptide_index,
+            marker_proteins=marker_search.marker_proteins,
+            taxon_protein_peptides=mapping_result.taxon_protein_peptides,
+            min_marker_families=int(config.get("min_marker_families", 3)),
+            min_marker_psms=float(config.get("min_marker_psms", 1.0)),
+        )
+
+        log_marker_diagnostics(result, logger_obj=logger)
+        return result
+
+    @staticmethod
+    def _write_marker_outputs(result, output_dir) -> None:
+        """Write ``marker_correction_results.tsv`` and the diagnostic txt."""
+        from .abundance_em_core.marker_correction import log_marker_diagnostics
+        import numpy as np
+
+        taxon_dir = Path(str(output_dir)) / "taxon"
+        taxon_dir.mkdir(parents=True, exist_ok=True)
+
+        tsv_path = taxon_dir / "marker_correction_results.tsv"
+        order = np.argsort(-result.cell_abundance)
+        with tsv_path.open("w", encoding="utf-8") as fh:
+            fh.write(
+                "taxon_id\ttaxon_name\tpsm_abundance\tcell_abundance\t"
+                "marker_signal\tmarker_families\tmarker_psms\t"
+                "has_marker_estimate\n"
+            )
+            for t in order:
+                lbl = result.taxon_labels[t]
+                tid, tname = lbl.split("|", 1) if "|" in lbl else ("0", lbl)
+                fh.write(
+                    f"{tid}\t{tname}\t"
+                    f"{result.psm_abundance[t]:.6f}\t"
+                    f"{result.cell_abundance[t]:.6f}\t"
+                    f"{result.marker_signal[t]:.4f}\t"
+                    f"{int(result.marker_families_per_taxon[t])}\t"
+                    f"{result.marker_psm_count[t]:.4f}\t"
+                    f"{int(bool(result.has_marker_estimate[t]))}\n"
+                )
+
+        diag_path = taxon_dir / "marker_diagnostics.txt"
+        report = log_marker_diagnostics(result)
+        diag_path.write_text(report, encoding="utf-8")
+        logger.info("Marker correction outputs: %s, %s", tsv_path, diag_path)

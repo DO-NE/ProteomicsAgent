@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -24,6 +25,48 @@ from .accession_resolver import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MappingMatrixResult:
+    """Bundle of artifacts produced by :func:`build_mapping_matrix`.
+
+    Attributes
+    ----------
+    matrix : np.ndarray, shape ``(P, T)``
+        Dense ``int8`` peptide-to-taxon mapping matrix.
+    peptide_list : list of str
+        Row labels (observed peptides, deduplicated, in first-seen order).
+    peptide_index : dict[str, int]
+        ``peptide_sequence -> row index``.  Inverse of :attr:`peptide_list`.
+    taxon_labels : list of str
+        Column labels in the form ``"<taxon_id>|<taxon_name>"``.
+    taxon_protein_peptides : dict[str, dict[str, list[str]]]
+        ``taxon_label -> {protein_accession -> [peptide_sequences]}``.  Only
+        proteins that produced at least one *observed* peptide are stored;
+        the inner peptide lists are sorted and deduplicated.  This is the
+        provenance information consumed by post-EM marker-based correction.
+    unclassified_peptides : list of (str, str)
+        ``(peptide_sequence, protein_accession)`` pairs for peptides whose
+        only matches were against unclassified proteins (so the row sum in
+        :attr:`matrix` is zero).
+    """
+
+    matrix: np.ndarray
+    peptide_list: list
+    peptide_index: dict
+    taxon_labels: list
+    taxon_protein_peptides: dict = field(default_factory=dict)
+    unclassified_peptides: list = field(default_factory=list)
+
+    # Backwards-compatible iteration: the historical return order was
+    # ``(matrix, peptide_list, taxon_labels, unclassified_peptides)``.  Old
+    # callers using positional unpacking continue to work without changes.
+    def __iter__(self):
+        yield self.matrix
+        yield self.peptide_list
+        yield self.taxon_labels
+        yield self.unclassified_peptides
 
 try:
     from pyteomics import parser as _pyteomics_parser  # type: ignore
@@ -117,25 +160,15 @@ def build_mapping_matrix(
 
     Returns
     -------
-    A : np.ndarray, shape ``(P, T)``
-        Dense ``int8`` mapping matrix. Internally a sparse representation is
-        used during construction; conversion to dense happens at return time.
-        Columns for the sentinel ``("0", "unclassified")`` taxon are **not**
-        included; peptides that only map to unclassified proteins appear as
-        all-zero rows and are tracked in ``unclassified_peptides``.
-    peptide_list : list of str
-        Row labels matching the original ``peptides`` order, with duplicates
-        removed (first occurrence wins). Peptides not present in any digested
-        protein still appear in the output as all-zero rows so the row order
-        matches the caller's input expectation.
-    taxon_list : list of str
-        Column labels in the form ``"<taxon_id>|<taxon_name>"``. Taxa with
-        zero matched peptides are dropped from the column dimension.
-    unclassified_peptides : list of (str, str)
-        ``(peptide_sequence, protein_accession)`` pairs for peptides that
-        matched proteins lacking any usable taxon annotation (and did not
-        also match a real taxon).  The caller is expected to log these to
-        a TSV for downstream diagnosis.
+    MappingMatrixResult
+        Dataclass bundling the dense ``(P, T)`` matrix, the peptide row
+        labels and their inverse index, the taxon column labels in the
+        form ``"<taxon_id>|<taxon_name>"``, the per-taxon per-protein
+        peptide provenance map, and the unclassified-peptide diagnostic
+        list.  For backwards compatibility, the dataclass also iterates
+        as the historical 4-tuple
+        ``(matrix, peptide_list, taxon_labels, unclassified_peptides)``,
+        so positional unpacking by older callers continues to work.
 
     Notes
     -----
@@ -349,7 +382,9 @@ def build_mapping_matrix(
 
     # Bucket the resolved records.  Unclassified proteins are tracked
     # separately so we can digest them to find peptides that would be
-    # excluded from the EM.
+    # excluded from the EM.  Each bucket stores ``(accession, seq)`` pairs
+    # so the digestion loop can attribute observed peptides to their
+    # source proteins.
     unclassified_seqs: list = []   # list of (accession, seq)
     for accession, _uniprot_acc, key, seq in final_records:
         protein_taxon[accession] = key
@@ -358,12 +393,19 @@ def build_mapping_matrix(
         if key == ("0", "unclassified"):
             unclassified_seqs.append((accession, seq))
             continue
-        taxon_buckets.setdefault(key, []).append(seq)
+        taxon_buckets.setdefault(key, []).append((accession, seq))
 
     if not taxon_buckets:
         logger.warning("FASTA file %s yielded no parseable records", fasta_path)
         empty = np.zeros((P, 0), dtype=np.int8)
-        return empty, peptide_list, [], []
+        return MappingMatrixResult(
+            matrix=empty,
+            peptide_list=peptide_list,
+            peptide_index=dict(pep_index),
+            taxon_labels=[],
+            taxon_protein_peptides={},
+            unclassified_peptides=[],
+        )
 
     logger.info(
         "Digesting %d taxa from %s (enzyme=%s, missed_cleavages=%d)",
@@ -382,14 +424,25 @@ def build_mapping_matrix(
     target_pepset = set(peptide_list)  # for O(1) membership tests
     if not target_pepset:
         empty = np.zeros((0, 0), dtype=np.int8)
-        return empty, peptide_list, [], []
+        return MappingMatrixResult(
+            matrix=empty,
+            peptide_list=peptide_list,
+            peptide_index=dict(pep_index),
+            taxon_labels=[],
+            taxon_protein_peptides={},
+            unclassified_peptides=[],
+        )
 
     surviving_columns: list = []
     next_col = 0
+    # Per-taxon, per-protein observed-peptide provenance.  Keyed by the
+    # ``"id|name"`` taxon label the EM consumes downstream.
+    taxon_protein_peptides: dict = {}
     for taxon_id, taxon_name in taxon_keys_ordered:
-        seqs = taxon_buckets[(taxon_id, taxon_name)]
+        proteins = taxon_buckets[(taxon_id, taxon_name)]
         hits: set = set()
-        for seq in seqs:
+        proto_to_peps: dict = {}  # accession -> set of observed peptides
+        for accession, seq in proteins:
             for pep in _digest(
                 seq,
                 enzyme=enzyme,
@@ -399,6 +452,7 @@ def build_mapping_matrix(
             ):
                 if pep in target_pepset:
                     hits.add(pep)
+                    proto_to_peps.setdefault(accession, set()).add(pep)
         if not hits:
             continue
         for pep in hits:
@@ -406,6 +460,11 @@ def build_mapping_matrix(
             cols.append(next_col)
         surviving_columns.append((taxon_id, taxon_name))
         next_col += 1
+        if proto_to_peps:
+            label = f"{taxon_id}|{taxon_name}"
+            taxon_protein_peptides[label] = {
+                acc: sorted(peps) for acc, peps in proto_to_peps.items()
+            }
 
     T = next_col
     if T == 0:
@@ -414,7 +473,14 @@ def build_mapping_matrix(
             fasta_path,
         )
         empty = np.zeros((P, 0), dtype=np.int8)
-        return empty, peptide_list, [], []
+        return MappingMatrixResult(
+            matrix=empty,
+            peptide_list=peptide_list,
+            peptide_index=dict(pep_index),
+            taxon_labels=[],
+            taxon_protein_peptides={},
+            unclassified_peptides=[],
+        )
 
     # Substring matching for unmatched peptides using pepXML protein context.
     n_exact = len(rows)
@@ -448,6 +514,13 @@ def build_mapping_matrix(
                         cols.append(taxon_col[tk])
                         n_substring_matched += 1
                         matched_taxa.add(tk)
+                        # Record provenance so marker correction sees
+                        # substring-matched peptides too.
+                        label = f"{tk[0]}|{tk[1]}"
+                        protein_map = taxon_protein_peptides.setdefault(label, {})
+                        peps = protein_map.setdefault(protein_acc, [])
+                        if pep not in peps:
+                            peps.append(pep)
         if n_substring_matched > 0:
             logger.info(
                 "Substring matching: %d additional peptide-taxon assignments "
@@ -507,7 +580,20 @@ def build_mapping_matrix(
             len(unclassified_peptides),
         )
 
-    return A, peptide_list, taxon_labels, unclassified_peptides
+    # Re-canonicalise per-protein peptide lists (substring matching above
+    # may have appended unsorted entries).
+    for label, prot_map in taxon_protein_peptides.items():
+        for acc, peps in prot_map.items():
+            prot_map[acc] = sorted(set(peps))
+
+    return MappingMatrixResult(
+        matrix=A,
+        peptide_list=peptide_list,
+        peptide_index=dict(pep_index),
+        taxon_labels=taxon_labels,
+        taxon_protein_peptides=taxon_protein_peptides,
+        unclassified_peptides=unclassified_peptides,
+    )
 
 
 def apply_detectability_weights(

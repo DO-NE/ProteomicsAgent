@@ -122,6 +122,26 @@ def cli() -> None:
     default=None,
     help="Organism-name normalisation depth: species collapses strains to binomials, strain preserves them.",
 )
+@click.option(
+    "--marker-correction/--no-marker-correction",
+    default=False,
+    help=(
+        "Run post-EM marker-based cell-equivalent abundance correction. "
+        "Requires HMMER and a directory of GTDB bac120/ar53 HMM profiles "
+        "(see --hmm-profile-dir)."
+    ),
+)
+@click.option(
+    "--hmm-profile-dir",
+    "hmm_profile_dir",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help=(
+        "Directory containing GTDB bac120/ar53 HMM profile bundles "
+        "(produced by scripts/download_marker_hmms.py). Required when "
+        "--marker-correction is enabled."
+    ),
+)
 def run_cmd(
     input_path: Path,
     database_path: Path,
@@ -132,6 +152,8 @@ def run_cmd(
     resolve_uniprot: bool | None,
     prefix_map: Path | None,
     taxon_level: str | None,
+    marker_correction: bool,
+    hmm_profile_dir: Path | None,
 ) -> None:
     """Start a new run or resume latest if user confirms."""
 
@@ -150,6 +172,15 @@ def run_cmd(
         os.environ["TAXON_PREFIX_MAP_FILE"] = str(prefix_map)
     if taxon_level:
         os.environ["TAXON_LEVEL"] = taxon_level
+    if marker_correction:
+        if hmm_profile_dir is None:
+            console.print(Panel(
+                "--hmm-profile-dir is required when --marker-correction is set.",
+                style="red",
+            ))
+            raise SystemExit(1)
+        os.environ["TAXON_MARKER_CORRECTION"] = "true"
+        os.environ["TAXON_HMM_PROFILE_DIR"] = str(hmm_profile_dir)
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
@@ -279,6 +310,21 @@ def start_server_cmd() -> None:
     default=None,
     help="Organism-name normalisation depth: species collapses strains to binomials, strain preserves them.",
 )
+@click.option(
+    "--marker-correction/--no-marker-correction",
+    default=False,
+    help=(
+        "Run post-EM marker-based cell-equivalent abundance correction. "
+        "Requires HMMER and --hmm-profile-dir."
+    ),
+)
+@click.option(
+    "--hmm-profile-dir",
+    "hmm_profile_dir",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Directory with GTDB bac120/ar53 HMM bundles (used with --marker-correction).",
+)
 def run_pipeline_cmd(
     input_path: Path,
     database_path: Path,
@@ -287,6 +333,8 @@ def run_pipeline_cmd(
     resolve_uniprot: bool | None,
     prefix_map: Path | None,
     taxon_level: str | None,
+    marker_correction: bool,
+    hmm_profile_dir: Path | None,
 ) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
@@ -304,6 +352,15 @@ def run_pipeline_cmd(
         os.environ["TAXON_PREFIX_MAP_FILE"] = str(prefix_map)
     if taxon_level:
         os.environ["TAXON_LEVEL"] = taxon_level
+    if marker_correction:
+        if hmm_profile_dir is None:
+            console.print(Panel(
+                "--hmm-profile-dir is required when --marker-correction is set.",
+                style="red",
+            ))
+            raise SystemExit(1)
+        os.environ["TAXON_MARKER_CORRECTION"] = "true"
+        os.environ["TAXON_HMM_PROFILE_DIR"] = str(hmm_profile_dir)
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
