@@ -504,10 +504,12 @@ class TestBuildMappingMatrixFiltering:
                 fasta_path=fasta,
                 exclude_prefixes=["DECOY", "contag"],
             )
-            # Only KP and SA taxa should survive.
-            label_names = [lbl.split("|", 1)[1] for lbl in taxon_labels]
-            assert "Klebsiella pneumoniae" in label_names
-            assert "Staphylococcus aureus" in label_names
+            # Only KP and SA taxa should survive.  With prefix-based taxon
+            # ids, the label format is "prefix|display_name", so we check
+            # for the organism string anywhere in the full label rather than
+            # an exact match on the name portion.
+            assert any("Klebsiella pneumoniae" in lbl for lbl in taxon_labels)
+            assert any("Staphylococcus aureus" in lbl for lbl in taxon_labels)
             assert len(taxon_labels) == 2
 
     def test_no_filter_includes_all(self):
@@ -634,8 +636,10 @@ class TestPrefixCohortInference:
             assert "Chromobacterium violaceum" in label_names
             # No "unclassified" column in the matrix.
             assert "unclassified" not in label_names
-            # ZZUNK_peg.1's peptide should show up in unclassified list.
-            assert any(pep == "LONELYPEPTIDER" for pep, _acc in unclassified)
+            # With prefix-based bucketing, ZZUNK_peg.1 gets its own "ZZUNK"
+            # taxon column, so LONELYPEPTIDER is matched (not unclassified).
+            assert not any(pep == "LONELYPEPTIDER" for pep, _acc in unclassified)
+            assert any("ZZUNK" in lbl for lbl in taxon_labels)
 
     def test_user_prefix_map_overrides(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -654,13 +658,13 @@ class TestPrefixCohortInference:
             # ZZUNK was rescued by user map so nothing should be unclassified
             assert not any(pep == "LONELYPEPTIDER" for pep, _acc in unclassified)
 
-    def test_species_level_deduplication(self):
-        """Strain-level OX ids that normalize to the same species should merge."""
+    def test_same_prefix_strains_merge(self):
+        """Two proteins sharing the same FASTA prefix produce a single taxon column."""
         fasta_content = (
-            # Two strains of Pseudomonas aeruginosa with different OX ids.
-            ">sp|P1|PA1 Prot1 OS=Pseudomonas aeruginosa (strain ATCC 15692) OX=208964 GN=x PE=1 SV=1\n"
+            # Both strains use prefix "PA" → one bucket regardless of strain annotation.
+            ">PA_prot1 Prot1 OS=Pseudomonas aeruginosa (strain ATCC 15692) OX=208964 GN=x PE=1 SV=1\n"
             "AGIVDEKRPEPTIDER\n"
-            ">sp|P2|PA2 Prot2 OS=Pseudomonas aeruginosa (strain PAO1) OX=208963 GN=y PE=1 SV=1\n"
+            ">PA_prot2 Prot2 OS=Pseudomonas aeruginosa (strain PAO1) OX=208963 GN=y PE=1 SV=1\n"
             "ANOTHERPEPTIDEK\n"
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -673,10 +677,9 @@ class TestPrefixCohortInference:
                 fasta_path=fasta,
                 taxon_level="species",
             )
-            label_names = [lbl.split("|", 1)[1] for lbl in taxon_labels]
-            # Both strains should merge into a single "Pseudomonas aeruginosa" column.
-            assert label_names.count("Pseudomonas aeruginosa") == 1
+            # Shared prefix "PA" → single taxon column.
             assert len(taxon_labels) == 1
+            assert any("Pseudomonas aeruginosa" in lbl for lbl in taxon_labels)
 
     def test_strain_level_preserves_biovars(self):
         """With taxon_level='strain', sub-species markers outside parens stay distinct."""
@@ -701,12 +704,13 @@ class TestPrefixCohortInference:
             # Strain mode keeps "bv. viciae" vs "bv. trifolii" distinct.
             assert len(taxon_labels) == 2
 
-    def test_species_level_collapses_biovars(self):
-        """With taxon_level='species', biovars merge into the binomial."""
+    def test_same_prefix_biovars_merge(self):
+        """Two biovars with the same FASTA prefix appear as one taxon column."""
         fasta_content = (
-            ">sp|P1|RLV1 Prot1 OS=Rhizobium leguminosarum bv. viciae OX=384 GN=x PE=1 SV=1\n"
+            # Both biovars use prefix "RL" → merged into one bucket.
+            ">RL_prot1 Prot1 OS=Rhizobium leguminosarum bv. viciae OX=384 GN=x PE=1 SV=1\n"
             "AGIVDEKRPEPTIDER\n"
-            ">sp|P2|RLT1 Prot2 OS=Rhizobium leguminosarum bv. trifolii OX=382 GN=y PE=1 SV=1\n"
+            ">RL_prot2 Prot2 OS=Rhizobium leguminosarum bv. trifolii OX=382 GN=y PE=1 SV=1\n"
             "ANOTHERPEPTIDEK\n"
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -719,9 +723,9 @@ class TestPrefixCohortInference:
                 fasta_path=fasta,
                 taxon_level="species",
             )
-            label_names = [lbl.split("|", 1)[1] for lbl in taxon_labels]
-            assert label_names.count("Rhizobium leguminosarum") == 1
+            # Shared prefix "RL" → single column; display name from majority OS= vote.
             assert len(taxon_labels) == 1
+            assert any("Rhizobium leguminosarum" in lbl for lbl in taxon_labels)
 
     def test_sanity_filter_rejects_functional_header(self):
         """The bracket parser should not treat functional annotations as taxa."""

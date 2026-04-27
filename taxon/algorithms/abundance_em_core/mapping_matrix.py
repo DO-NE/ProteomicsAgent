@@ -19,10 +19,6 @@ from typing import Iterator, Optional
 import numpy as np
 from scipy.sparse import csc_matrix
 
-from .accession_resolver import (
-    extract_uniprot_accession,
-    resolve_accessions,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -211,48 +207,51 @@ def build_mapping_matrix(
     protein_taxon: dict = {}  # accession -> taxon_key (for substring matching)
     protein_seqs: dict = {}   # accession -> sequence (for substring matching)
 
-    # Load the user-supplied prefix map up-front so it can override inferred
-    # mappings during the cohort phase.
+    # Load user-supplied prefix map for display-name overrides.
     user_prefix_map: dict = (
         _load_prefix_map(prefix_map_file) if prefix_map_file else {}
     )
 
-    # First pass: parse every header so we can optionally look up organisms
-    # for bare UniProt-accession headers before building the taxon buckets.
-    parsed_records: list = []  # (accession, uniprot_acc, initial_key, seq)
-    known_acc_organism: dict = {}  # UniProt accession -> organism (from fasta)
-    organism_to_taxid: dict = {}   # organism name -> taxon_id (from fasta)
-    unresolved_uniprot: set = set()
+    # First pass: iterate every protein, collecting the accession prefix and
+    # voting on the OS= display name for each prefix.
+    #
+    # Taxon ASSIGNMENT is always by prefix (text before the first underscore
+    # in the accession); the OS= / bracket / other header fields are used
+    # only to choose a human-readable display label — never for grouping.
+    # This prevents description-derived garbage (e.g. "acylating",
+    # "Rhizobiales") from appearing as separate taxa, and ensures that every
+    # prefix present in the FASTA produces exactly one taxon column.
+    raw_records: list = []      # (accession, prefix, os_key, seq)
+    prefix_os_votes: dict = {}  # prefix -> {os_name: count}
     total_proteins = 0
-    classified_by_header = 0
-    unclassified_initial = 0
     rejected_by_filter = 0
+
     for header, seq in _iter_fasta(fasta):
         if _should_exclude(header, exclude_prefixes):
             continue
         total_proteins += 1
         accession = _extract_accession(header)
-        uniprot_acc = extract_uniprot_accession(accession)
-        key, rejected_name = _parse_header_detailed(header, taxon_level=taxon_level)
+        prefix = _extract_prefix(accession)
+
+        # Parse OS= for display-name voting only (not for taxon assignment).
+        os_key, rejected_name = _parse_header_detailed(header, taxon_level=taxon_level)
         if rejected_name is not None:
             rejected_by_filter += 1
             logger.debug(
                 "sanity filter rejected candidate organism %r from header %r",
                 rejected_name, accession,
             )
-        if key == ("0", "unclassified"):
-            unclassified_initial += 1
-            if resolve_uniprot and uniprot_acc:
-                unresolved_uniprot.add(uniprot_acc)
-        else:
-            classified_by_header += 1
-            if uniprot_acc and uniprot_acc not in known_acc_organism:
-                known_acc_organism[uniprot_acc] = key[1]
-            # Prefer a numeric OX-derived id over a slug for the same name.
-            existing = organism_to_taxid.get(key[1])
-            if existing is None or (not existing.isdigit() and key[0].isdigit()):
-                organism_to_taxid[key[1]] = key[0]
-        parsed_records.append((accession, uniprot_acc, key, seq))
+
+        raw_records.append((accession, prefix, os_key, seq))
+
+        if prefix and os_key != ("0", "unclassified"):
+            votes = prefix_os_votes.setdefault(prefix, {})
+            votes[os_key[1]] = votes.get(os_key[1], 0) + 1
+
+        if prefix == "P22":
+            logger.debug(
+                "P22 protein parsed: accession=%s os_key=%s", accession, os_key
+            )
 
     if rejected_by_filter:
         logger.info(
@@ -261,139 +260,55 @@ def build_mapping_matrix(
             rejected_by_filter,
         )
 
-    # Phase 1 + 2 resolution for bare UniProt accessions.
-    acc_to_organism: dict = {}
-    if resolve_uniprot and unresolved_uniprot:
-        acc_to_organism = resolve_accessions(
-            fasta_path=fasta_path,
-            unresolved_accessions=unresolved_uniprot,
-            known_accession_organism=known_acc_organism,
-            use_api=True,
-        )
+    # Determine display name per prefix: majority-vote OS= name, prefix as fallback.
+    prefix_display: dict = {}  # prefix -> display_name
+    for prefix, votes in prefix_os_votes.items():
+        best_name = max(votes, key=votes.__getitem__)
+        prefix_display[prefix] = best_name
 
-    # Apply UniProt resolution results to parsed_records in place.
-    resolved_parsed: list = []
-    resolved_via_lookup = 0
-    for accession, uniprot_acc, key, seq in parsed_records:
-        if key == ("0", "unclassified") and uniprot_acc:
-            organism = acc_to_organism.get(uniprot_acc)
-            if organism and _is_valid_taxon_name(organism):
-                taxid = organism_to_taxid.get(organism) or _slug(organism)
-                key = (taxid, organism)
-                resolved_via_lookup += 1
-        resolved_parsed.append((accession, uniprot_acc, key, seq))
+    # User-supplied prefix map overrides inferred display names.
+    for p, (_tid, name) in user_prefix_map.items():
+        prefix_display[p] = name
 
-    # --- Prefix-cohort inference ------------------------------------------
-    # For entries that remain unclassified, consult the accession prefix
-    # (text before the first underscore) and reuse organism assignments
-    # learned from other proteins that share the same prefix.
-    prefix_totals: dict = {}   # prefix -> total entries (classified+unclassified)
-    prefix_votes: dict = {}    # prefix -> {key: count}
-    for accession, _uniprot_acc, key, _seq in resolved_parsed:
-        prefix = _extract_prefix(accession)
-        if not prefix:
-            continue
-        prefix_totals[prefix] = prefix_totals.get(prefix, 0) + 1
-        if key != ("0", "unclassified"):
-            votes = prefix_votes.setdefault(prefix, {})
-            votes[key] = votes.get(key, 0) + 1
-
-    inferred_prefix_map: dict = {}
-    for prefix, votes in prefix_votes.items():
-        total = prefix_totals.get(prefix, 0)
-        if total < 2:
-            # Singleton prefixes carry no predictive value; skip to avoid
-            # polluting the rescue path with unique per-protein prefixes
-            # (typical of UniProt-style sp|ACC|NAME_ORG accessions).
-            continue
-        best_key, best_n = max(votes.items(), key=lambda kv: kv[1])
-        if total > 0 and best_n / total >= 0.5 and _is_valid_taxon_name(best_key[1]):
-            inferred_prefix_map[prefix] = best_key
-            logger.info(
-                "Prefix cohort map: %s -> %s (%d/%d headers)",
-                prefix, best_key[1], best_n, total,
-            )
-
-    # Merge: user entries (already vetted by _load_prefix_map) override
-    # inferred ones, and can also supply prefixes that had zero classified
-    # headers on their own.
-    combined_prefix_map: dict = dict(inferred_prefix_map)
-    combined_prefix_map.update(user_prefix_map)
-
-    rescued_by_user = 0
-    rescued_by_cohort = 0
+    # Second pass: bucket every protein by its accession prefix.
+    # This is the canonical taxon assignment — OS= plays no role here.
+    unclassified_seqs: list = []
     still_unclassified = 0
-    final_records: list = []
-    for accession, uniprot_acc, key, seq in resolved_parsed:
-        if key == ("0", "unclassified"):
-            prefix = _extract_prefix(accession)
-            rescued_key = combined_prefix_map.get(prefix) if prefix else None
-            if rescued_key is not None:
-                key = rescued_key
-                if prefix in user_prefix_map:
-                    rescued_by_user += 1
-                else:
-                    rescued_by_cohort += 1
-            else:
-                still_unclassified += 1
-        final_records.append((accession, uniprot_acc, key, seq))
+    p22_bucket_count = 0
 
-    logger.info(
-        "Classification summary: total=%d, by_header=%d, via_uniprot_api=%d, "
-        "via_cohort_prefix=%d, via_user_prefix=%d, unclassified=%d",
-        total_proteins,
-        classified_by_header,
-        resolved_via_lookup,
-        rescued_by_cohort,
-        rescued_by_user,
-        still_unclassified,
-    )
-
-    # --- Species-level deduplication ------------------------------------
-    # After normalisation, multiple strain-level OX ids may map to the
-    # same species name (e.g. OX=123 and OX=456 both yield "Rhizobium
-    # leguminosarum").  Merge them into a single canonical key so that
-    # the EM sees one column per species.
-    name_to_keys: dict = {}  # taxon_name -> set of (taxon_id, taxon_name)
-    for _acc, _uacc, key, _seq in final_records:
-        if key != ("0", "unclassified"):
-            name_to_keys.setdefault(key[1], set()).add(key)
-
-    key_remap: dict = {}
-    for tname, keys in name_to_keys.items():
-        if len(keys) > 1:
-            canonical = (_slug(tname), tname)
-            for k in keys:
-                if k != canonical:
-                    key_remap[k] = canonical
-
-    if key_remap:
-        n_original = sum(len(ks) for ks in name_to_keys.values() if len(ks) > 1)
-        n_merged = sum(1 for ks in name_to_keys.values() if len(ks) > 1)
-        logger.info(
-            "Collapsed %d strain-level entries into %d species-level taxa",
-            n_original,
-            n_merged,
-        )
-        final_records = [
-            (acc, uacc, key_remap.get(key, key), seq)
-            for acc, uacc, key, seq in final_records
-        ]
-
-    # Bucket the resolved records.  Unclassified proteins are tracked
-    # separately so we can digest them to find peptides that would be
-    # excluded from the EM.  Each bucket stores ``(accession, seq)`` pairs
-    # so the digestion loop can attribute observed peptides to their
-    # source proteins.
-    unclassified_seqs: list = []   # list of (accession, seq)
-    for accession, _uniprot_acc, key, seq in final_records:
-        protein_taxon[accession] = key
-        if pepxml_protein_map is not None:
-            protein_seqs[accession] = seq
-        if key == ("0", "unclassified"):
+    for accession, prefix, _os_key, seq in raw_records:
+        if not prefix:
+            still_unclassified += 1
             unclassified_seqs.append((accession, seq))
             continue
-        taxon_buckets.setdefault(key, []).append((accession, seq))
+
+        display_name = prefix_display.get(prefix, prefix)
+        taxon_key = (prefix, display_name)
+
+        protein_taxon[accession] = taxon_key
+        if pepxml_protein_map is not None:
+            protein_seqs[accession] = seq
+        taxon_buckets.setdefault(taxon_key, []).append((accession, seq))
+
+        if prefix == "P22":
+            p22_bucket_count += 1
+            logger.debug(
+                "P22 protein bucketed: accession=%s -> key=%s",
+                accession, taxon_key,
+            )
+
+    if p22_bucket_count:
+        logger.info(
+            "P22 prefix: %d proteins bucketed into taxon (%r, %r)",
+            p22_bucket_count, "P22", prefix_display.get("P22", "P22"),
+        )
+
+    logger.info(
+        "Classification summary: total=%d classified_by_prefix=%d unclassified=%d",
+        total_proteins,
+        total_proteins - still_unclassified,
+        still_unclassified,
+    )
 
     if not taxon_buckets:
         logger.warning("FASTA file %s yielded no parseable records", fasta_path)
