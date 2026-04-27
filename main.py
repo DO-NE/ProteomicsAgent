@@ -142,6 +142,11 @@ def cli() -> None:
         "--marker-correction is enabled."
     ),
 )
+@click.option(
+    "--proteome-mass-correction/--no-proteome-mass-correction",
+    default=False,
+    help="Enable proteome-size-weighted protein-biomass abundance correction",
+)
 def run_cmd(
     input_path: Path,
     database_path: Path,
@@ -154,6 +159,7 @@ def run_cmd(
     taxon_level: str | None,
     marker_correction: bool,
     hmm_profile_dir: Path | None,
+    proteome_mass_correction: bool,
 ) -> None:
     """Start a new run or resume latest if user confirms."""
 
@@ -181,6 +187,8 @@ def run_cmd(
             raise SystemExit(1)
         os.environ["TAXON_MARKER_CORRECTION"] = "true"
         os.environ["TAXON_HMM_PROFILE_DIR"] = str(hmm_profile_dir)
+    if proteome_mass_correction:
+        os.environ["TAXON_PROTEOME_MASS_CORRECTION"] = "true"
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)
@@ -325,6 +333,11 @@ def start_server_cmd() -> None:
     default=None,
     help="Directory with GTDB bac120/ar53 HMM bundles (used with --marker-correction).",
 )
+@click.option(
+    "--proteome-mass-correction/--no-proteome-mass-correction",
+    default=False,
+    help="Enable proteome-size-weighted protein-biomass abundance correction",
+)
 def run_pipeline_cmd(
     input_path: Path,
     database_path: Path,
@@ -335,6 +348,7 @@ def run_pipeline_cmd(
     taxon_level: str | None,
     marker_correction: bool,
     hmm_profile_dir: Path | None,
+    proteome_mass_correction: bool,
 ) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
@@ -361,6 +375,8 @@ def run_pipeline_cmd(
             raise SystemExit(1)
         os.environ["TAXON_MARKER_CORRECTION"] = "true"
         os.environ["TAXON_HMM_PROFILE_DIR"] = str(hmm_profile_dir)
+    if proteome_mass_correction:
+        os.environ["TAXON_PROTEOME_MASS_CORRECTION"] = "true"
     settings = load_settings()
     if not _startup_checks():
         raise SystemExit(1)

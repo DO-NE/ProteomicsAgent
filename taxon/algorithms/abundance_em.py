@@ -304,6 +304,14 @@ class AbundanceEMPlugin(TaxonPlugin):
                 config=config,
             )
 
+        # --- Proteome-mass correction (Cycle 5b, opt-in) ---
+        biomass_result = None
+        if config.get("proteome_mass_correction", False):
+            biomass_result = self._run_proteome_mass_correction(
+                model=model,
+                mapping_result=mapping_result,
+            )
+
         # Convert to TaxonResult objects.
         results: list = []
         confidences = self._confidences(model.standard_errors_)
@@ -341,6 +349,9 @@ class AbundanceEMPlugin(TaxonPlugin):
         # changing the meaning of TaxonResult.abundance.
         if marker_result is not None and output_dir:
             self._write_marker_outputs(marker_result, output_dir)
+
+        if biomass_result is not None and output_dir:
+            self._write_biomass_results(biomass_result, output_dir)
 
         return results
 
@@ -475,3 +486,59 @@ class AbundanceEMPlugin(TaxonPlugin):
         report = log_marker_diagnostics(result)
         diag_path.write_text(report, encoding="utf-8")
         logger.info("Marker correction outputs: %s, %s", tsv_path, diag_path)
+
+    # ------------------------------------------------- proteome-mass correction
+
+    @staticmethod
+    def _run_proteome_mass_correction(model, mapping_result):
+        """Run proteome-size-weighted biomass correction.
+
+        Returns a :class:`ProteomeMassCorrectionResult`, or ``None`` on failure
+        (errors are logged at WARNING and never raised).
+        """
+        from .abundance_em_core.proteome_mass_correction import (
+            compute_proteome_sizes,
+            compute_biomass_abundance,
+            log_proteome_mass_diagnostics,
+        )
+
+        try:
+            proteome_sizes = compute_proteome_sizes(
+                taxon_protein_peptides=mapping_result.taxon_protein_peptides,
+                taxon_labels=mapping_result.taxon_labels,
+            )
+            biomass_result = compute_biomass_abundance(
+                pi=model.pi_,
+                proteome_sizes=proteome_sizes,
+                taxon_labels=mapping_result.taxon_labels,
+            )
+            log_proteome_mass_diagnostics(biomass_result, logger=logger)
+            return biomass_result
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Proteome-mass correction failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _write_biomass_results(result, output_dir) -> None:
+        """Write ``biomass_correction_results.tsv`` to the taxon output dir."""
+        import numpy as np
+
+        taxon_dir = Path(str(output_dir)) / "taxon"
+        taxon_dir.mkdir(parents=True, exist_ok=True)
+
+        tsv_path = taxon_dir / "biomass_correction_results.tsv"
+        order = np.argsort(-result.biomass_abundance)
+        with tsv_path.open("w", encoding="utf-8") as fh:
+            fh.write(
+                "taxon_id\ttaxon_name\tpsm_abundance\tbiomass_abundance\tproteome_size\n"
+            )
+            for t in order:
+                lbl = result.taxon_labels[t]
+                tid, tname = lbl.split("|", 1) if "|" in lbl else ("0", lbl)
+                fh.write(
+                    f"{tid}\t{tname}\t"
+                    f"{result.psm_abundance[t]:.6f}\t"
+                    f"{result.biomass_abundance[t]:.6f}\t"
+                    f"{int(result.proteome_sizes[t])}\n"
+                )
+        logger.info("Biomass correction output: %s", tsv_path)

@@ -260,6 +260,11 @@ class Orchestrator:
         )
         if hmm_profile_dir:
             config["hmm_profile_dir"] = hmm_profile_dir
+        proteome_mass_env = os.getenv("TAXON_PROTEOME_MASS_CORRECTION")
+        if "proteome_mass_correction" in params:
+            config["proteome_mass_correction"] = bool(params["proteome_mass_correction"])
+        elif proteome_mass_env is not None:
+            config["proteome_mass_correction"] = proteome_mass_env.lower() not in ("0", "false", "no")
         config["output_dir"] = str(self.run_dir)
 
         results = self.taxon_registry.run(algorithm, peptides, config)
