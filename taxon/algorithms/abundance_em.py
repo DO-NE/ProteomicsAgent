@@ -504,7 +504,7 @@ class AbundanceEMPlugin(TaxonPlugin):
 
         try:
             proteome_sizes = compute_proteome_sizes(
-                taxon_protein_peptides=mapping_result.taxon_protein_peptides,
+                taxon_total_protein_counts=mapping_result.taxon_total_protein_counts,
                 taxon_labels=mapping_result.taxon_labels,
             )
             biomass_result = compute_biomass_abundance(

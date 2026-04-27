@@ -32,8 +32,8 @@ from taxon.algorithms.abundance_em_core.proteome_mass_correction import (
 
 def _make_taxon_protein_peptides(
     taxa_protein_counts: dict[str, int],
-) -> tuple[dict[str, dict[str, list[str]]], list[str]]:
-    """Build a synthetic taxon_protein_peptides dict with dummy peptides.
+) -> tuple[dict[str, int], list[str]]:
+    """Build a synthetic taxon_total_protein_counts dict.
 
     Parameters
     ----------
@@ -41,61 +41,57 @@ def _make_taxon_protein_peptides(
 
     Returns
     -------
-    (taxon_protein_peptides, taxon_labels)
+    (taxon_total_protein_counts, taxon_labels)
     """
-    taxon_protein_peptides: dict[str, dict[str, list[str]]] = {}
+    taxon_total_protein_counts: dict[str, int] = {}
     taxon_labels: list[str] = []
     for label, n_proteins in taxa_protein_counts.items():
         taxon_labels.append(label)
-        prot_map: dict[str, list[str]] = {}
-        for i in range(n_proteins):
-            acc = f"{label.split('|')[0]}_prot{i:04d}"
-            prot_map[acc] = [f"PEPTIDE{i:04d}"]
-        taxon_protein_peptides[label] = prot_map
-    return taxon_protein_peptides, taxon_labels
+        taxon_total_protein_counts[label] = n_proteins
+    return taxon_total_protein_counts, taxon_labels
 
 
 # ------------------------------------------------------------------ tests
 
 class TestComputeProteomeSizes:
     def test_basic_protein_count(self):
-        """W_t should equal the number of protein keys per taxon."""
-        tpp, labels = _make_taxon_protein_peptides({
+        """W_t should equal the total protein count per taxon."""
+        total_counts, labels = _make_taxon_protein_peptides({
             "LT2|Salmonella typhimurium": 100,
             "Cup|Cupriavidus metallidurans": 50,
             "Pae|Pseudomonas aeruginosa": 200,
         })
-        sizes = compute_proteome_sizes(tpp, labels)
+        sizes = compute_proteome_sizes(total_counts, labels)
         assert sizes.shape == (3,)
         assert int(sizes[0]) == 100
         assert int(sizes[1]) == 50
         assert int(sizes[2]) == 200
 
     def test_zero_proteins_fallback(self):
-        """A taxon with no proteins in tpp should get W_t = 1 (not 0)."""
-        tpp = {"A|TaxonA": {"A_prot0001": ["PEP1"]}, "B|TaxonB": {}}
+        """A taxon with zero total proteins should get W_t = 1 (not 0)."""
+        total_counts = {"A|TaxonA": 1, "B|TaxonB": 0}
         labels = ["A|TaxonA", "B|TaxonB"]
-        sizes = compute_proteome_sizes(tpp, labels)
+        sizes = compute_proteome_sizes(total_counts, labels)
         assert sizes[0] == 1
         assert sizes[1] == 1  # fallback from 0
 
     def test_missing_label_fallback(self):
-        """If a label is not in tpp at all, W_t should be 1."""
-        tpp = {"A|TaxonA": {"A_prot0001": ["PEP1"]}}
+        """If a label is not in taxon_total_protein_counts at all, W_t should be 1."""
+        total_counts = {"A|TaxonA": 1}
         labels = ["A|TaxonA", "B|TaxonB"]
-        sizes = compute_proteome_sizes(tpp, labels)
+        sizes = compute_proteome_sizes(total_counts, labels)
         assert sizes[0] == 1
         assert sizes[1] == 1
 
     def test_ordering_matches_taxon_labels(self):
-        """sizes[i] should correspond to taxon_labels[i], not insertion order of tpp."""
-        tpp, _ = _make_taxon_protein_peptides({
+        """sizes[i] should correspond to taxon_labels[i], not insertion order of total_counts."""
+        total_counts, _ = _make_taxon_protein_peptides({
             "X|TaxonX": 10,
             "Y|TaxonY": 30,
             "Z|TaxonZ": 5,
         })
         labels_reversed = ["Z|TaxonZ", "Y|TaxonY", "X|TaxonX"]
-        sizes = compute_proteome_sizes(tpp, labels_reversed)
+        sizes = compute_proteome_sizes(total_counts, labels_reversed)
         assert int(sizes[0]) == 5   # Z
         assert int(sizes[1]) == 30  # Y
         assert int(sizes[2]) == 10  # X
@@ -207,31 +203,24 @@ class TestLogProteomeMassDiagnostics:
 
 class TestIntegrationWithTaxonProteinPeptides:
     def test_protein_count_not_peptide_count(self):
-        """W_t counts protein accessions, not total peptides."""
-        # 2 proteins, 5 peptides each → W_t = 2
-        tpp = {
-            "A|TaxA": {
-                "prot_001": ["PEP1", "PEP2", "PEP3", "PEP4", "PEP5"],
-                "prot_002": ["PEP6", "PEP7", "PEP8", "PEP9", "PEP10"],
-            },
-            # 10 proteins, 1 peptide each → W_t = 10
-            "B|TaxB": {f"prot_{i:03d}": [f"PEP{100+i}"] for i in range(10)},
-        }
+        """W_t counts total FASTA protein entries, not observed peptides."""
+        # 2 total proteins → W_t = 2; 10 total proteins → W_t = 10
+        total_counts = {"A|TaxA": 2, "B|TaxB": 10}
         labels = ["A|TaxA", "B|TaxB"]
-        sizes = compute_proteome_sizes(tpp, labels)
+        sizes = compute_proteome_sizes(total_counts, labels)
 
         assert int(sizes[0]) == 2
         assert int(sizes[1]) == 10
 
     def test_full_pipeline_compute_sizes_then_biomass(self):
-        """End-to-end: build tpp, compute sizes, compute biomass."""
-        tpp, labels = _make_taxon_protein_peptides({
+        """End-to-end: build total_counts, compute sizes, compute biomass."""
+        total_counts, labels = _make_taxon_protein_peptides({
             "LT2|Salmonella typhimurium": 500,
             "Cup|Cupriavidus metallidurans": 250,
         })
         pi = np.array([0.5, 0.5])
 
-        sizes = compute_proteome_sizes(tpp, labels)
+        sizes = compute_proteome_sizes(total_counts, labels)
         result = compute_biomass_abundance(pi, sizes, labels)
 
         # W = [500, 250], pi = [0.5, 0.5]

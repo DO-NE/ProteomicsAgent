@@ -63,7 +63,7 @@ class ProteomeMassCorrectionResult:
 
 
 def compute_proteome_sizes(
-    taxon_protein_peptides: dict[str, dict[str, list[str]]],
+    taxon_total_protein_counts: dict[str, int],
     taxon_labels: list[str],
 ) -> np.ndarray:
     """
@@ -71,11 +71,10 @@ def compute_proteome_sizes(
 
     Parameters
     ----------
-    taxon_protein_peptides : dict
-        From MappingMatrixResult.taxon_protein_peptides:
-        taxon_label -> {protein_accession -> [peptide_sequences]}
-        This already contains the complete mapping of proteins to taxa
-        as parsed from the FASTA.
+    taxon_total_protein_counts : dict
+        From MappingMatrixResult.taxon_total_protein_counts:
+        taxon_label -> total protein count from FASTA (all entries, including
+        those with no observed peptides).
     taxon_labels : list[str]
         Ordered list of taxon labels matching the EM's column ordering.
 
@@ -96,12 +95,11 @@ def compute_proteome_sizes(
     """
     sizes = np.zeros(len(taxon_labels), dtype=np.float64)
     for t, label in enumerate(taxon_labels):
-        prot_map = taxon_protein_peptides.get(label, {})
-        n_proteins = len(prot_map)
+        n_proteins = taxon_total_protein_counts.get(label, 0)
         sizes[t] = max(n_proteins, 1)
         if n_proteins == 0:
             logger.warning(
-                "Taxon %r has zero proteins in taxon_protein_peptides; "
+                "Taxon %r has zero proteins in taxon_total_protein_counts; "
                 "setting W_t = 1 as fallback",
                 label,
             )

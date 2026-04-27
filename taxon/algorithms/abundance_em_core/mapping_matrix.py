@@ -42,6 +42,11 @@ class MappingMatrixResult:
         proteins that produced at least one *observed* peptide are stored;
         the inner peptide lists are sorted and deduplicated.  This is the
         provenance information consumed by post-EM marker-based correction.
+    taxon_total_protein_counts : dict[str, int]
+        ``taxon_label -> total number of protein entries in FASTA for that taxon``.
+        Populated during FASTA parsing, before any peptide filtering, so it
+        counts every ``>HEADER`` line regardless of whether any peptides from
+        that protein were observed.  Used by proteome-mass correction (W_t).
     unclassified_peptides : list of (str, str)
         ``(peptide_sequence, protein_accession)`` pairs for peptides whose
         only matches were against unclassified proteins (so the row sum in
@@ -53,6 +58,7 @@ class MappingMatrixResult:
     peptide_index: dict
     taxon_labels: list
     taxon_protein_peptides: dict = field(default_factory=dict)
+    taxon_total_protein_counts: dict = field(default_factory=dict)
     unclassified_peptides: list = field(default_factory=list)
 
     # Backwards-compatible iteration: the historical return order was
@@ -454,6 +460,14 @@ def build_mapping_matrix(
     # Encode column labels as "id|name" for the plugin wrapper.
     taxon_labels = [f"{tid}|{tname}" for tid, tname in surviving_columns]
 
+    # Total protein count per surviving taxon from FASTA (all entries, not just
+    # those with observed peptides). taxon_buckets already holds every protein
+    # for each taxon, so len() gives the true FASTA proteome size.
+    taxon_total_protein_counts = {
+        f"{tid}|{tname}": len(taxon_buckets[(tid, tname)])
+        for tid, tname in surviving_columns
+    }
+
     # --- Track peptides that only matched unclassified proteins -----------
     # Digest the unclassified proteins to see which observed peptides they
     # contain. Then cross-reference with A: if a peptide has no real-taxon
@@ -507,6 +521,7 @@ def build_mapping_matrix(
         peptide_index=dict(pep_index),
         taxon_labels=taxon_labels,
         taxon_protein_peptides=taxon_protein_peptides,
+        taxon_total_protein_counts=taxon_total_protein_counts,
         unclassified_peptides=unclassified_peptides,
     )
 
