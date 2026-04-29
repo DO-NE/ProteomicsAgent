@@ -70,6 +70,8 @@ def compute_cell_equivalent_abundance(
     taxon_protein_peptides: dict,
     min_marker_families: int = 3,
     min_marker_psms: float = 1.0,
+    taxon_kingdom: Optional[dict] = None,
+    exclude_kingdoms: frozenset = frozenset({"Eukaryota"}),
 ) -> MarkerCorrectionResult:
     """Convert PSM-level ``pi`` to a cell-equivalent relative abundance.
 
@@ -90,13 +92,25 @@ def compute_cell_equivalent_abundance(
     peptide_index : dict[str, int]
         ``peptide_sequence -> row index in A / responsibilities``.
     marker_proteins : dict
-        ``protein_accession -> (taxon_label, marker_family, evalue, score)``.
-        Typically obtained from
-        :func:`taxon.algorithms.abundance_em_core.hmm_marker_search.run_hmmsearch`.
-        The ``taxon_label`` in this tuple is informational; cross-referencing
-        against :paramref:`taxon_protein_peptides` is what actually drives
-        the calculation, so taxa whose accessions never produced an
-        observed peptide simply contribute zero signal.
+        ``protein_accession -> (taxon_label, families, evalue, score)``
+        where *families* is either a ``list[str]`` (current format, from
+        :func:`taxon.algorithms.abundance_em_core.hmm_marker_search.run_hmmsearch`)
+        or a plain ``str`` (legacy / hand-built test data — handled
+        transparently).  The ``taxon_label`` field is informational;
+        cross-referencing against :paramref:`taxon_protein_peptides` is
+        what actually drives the calculation.
+    taxon_kingdom : dict[str, str] or None, optional
+        ``taxon_label -> kingdom`` where kingdom is one of
+        ``"Bacteria"``, ``"Archaea"``, ``"Eukaryota"``, ``"Virus"``.
+        When provided, taxa whose kingdom is in *exclude_kingdoms* are
+        excluded from marker signal accumulation and always receive
+        ``has_marker_estimate=False``.  When ``None`` (default), all
+        taxa are eligible — backwards-compatible behaviour.
+    exclude_kingdoms : frozenset, default ``frozenset({"Eukaryota"})``
+        Set of kingdom strings to exclude from the cell-equivalent
+        estimate.  Eukaryotes are excluded by default because bac120/ar53
+        HMM profiles target prokaryotes and eukaryotic ribosomal-protein
+        homologs would otherwise pass the E-value filter.
     taxon_protein_peptides : dict
         ``taxon_label -> {protein_accession -> [observed peptides]}``.
         Provided by :class:`MappingMatrixResult`.
@@ -140,6 +154,23 @@ def compute_cell_equivalent_abundance(
 
     label_to_idx = {lbl: i for i, lbl in enumerate(taxon_labels)}
 
+    # Determine which taxon indices to exclude from marker signal.
+    # Eukaryotes (and any other kingdoms in exclude_kingdoms) should never
+    # receive a marker-based estimate: bac120/ar53 profiles target
+    # prokaryotes, and eukaryotic ribosomal-protein homologs can pass the
+    # E-value filter at 1e-10.
+    excluded_taxa: set = set()
+    if taxon_kingdom is not None:
+        for lbl, idx in label_to_idx.items():
+            kingdom = taxon_kingdom.get(lbl)
+            if kingdom is not None and kingdom in exclude_kingdoms:
+                excluded_taxa.add(idx)
+        if excluded_taxa:
+            logger.info(
+                "Marker correction: excluding %d taxon/taxa from kingdom(s) %s",
+                len(excluded_taxa), sorted(exclude_kingdoms),
+            )
+
     # ------------------------------------------------------------------ step 1
     # Marker peptide -> set of marker families.  A peptide may come from
     # several markers (e.g. ribosomal RpL2 and RpL14 both map to the same
@@ -153,19 +184,26 @@ def compute_cell_equivalent_abundance(
     n_marker_proteins_seen = 0
     for accession, payload in marker_proteins.items():
         try:
-            _hmm_taxon_label, family, _evalue, _score = payload
+            _hmm_taxon_label, families_raw, _evalue, _score = payload
         except (TypeError, ValueError):
             logger.debug(
                 "skipping malformed marker_proteins entry for %r: %r",
                 accession, payload,
             )
             continue
+        # families_raw is a list[str] in current format; plain str in old
+        # cache / hand-built test data — handle both transparently.
+        families_list = families_raw if isinstance(families_raw, list) else [families_raw]
         # Find this accession in any taxon bucket.  Marker proteins not
         # represented in taxon_protein_peptides (e.g. unclassified
         # proteins, or ones whose digest produced no observed peptides)
         # are silently skipped — they cannot contribute signal.
+        # Excluded-kingdom taxa are also skipped so their marker hits
+        # cannot inflate or contaminate the prokaryotic signal.
         appears_in = []
         for taxon_label, prot_map in taxon_protein_peptides.items():
+            if label_to_idx.get(taxon_label) in excluded_taxa:
+                continue
             peps = prot_map.get(accession)
             if peps:
                 appears_in.append((taxon_label, peps))
@@ -174,8 +212,10 @@ def compute_cell_equivalent_abundance(
         n_marker_proteins_seen += 1
         for taxon_label, peps in appears_in:
             for pep in peps:
-                peptide_to_families[pep].add(family)
-                peptide_to_taxa[pep].add(taxon_label)
+                pep_upper = pep.upper()
+                for family in families_list:
+                    peptide_to_families[pep_upper].add(family)
+                peptide_to_taxa[pep_upper].add(taxon_label)
 
     marker_peptides = sorted(peptide_to_families.keys())
     n_marker_peptide_rows = sum(1 for p in marker_peptides if p in peptide_index)
@@ -200,10 +240,10 @@ def compute_cell_equivalent_abundance(
 
     total_marker_psms = 0.0
     for pep, families in peptide_to_families.items():
-        p_idx = peptide_index.get(pep)
+        p_idx = peptide_index.get(pep.upper())
         if p_idx is None:
             continue
-        y_p = float(spectral_counts.get(pep, 0))
+        y_p = float(spectral_counts.get(pep.upper(), 0))
         if y_p <= 0:
             continue
         r_row = responsibilities[p_idx]  # (T,)
@@ -238,6 +278,10 @@ def compute_cell_equivalent_abundance(
         (marker_families_per_taxon >= min_marker_families)
         & (marker_psm_count >= min_marker_psms)
     )
+    # Override: excluded-kingdom taxa (e.g. Eukaryota) never receive a
+    # marker-based estimate, regardless of signal strength.
+    for t in excluded_taxa:
+        has_marker_estimate[t] = False
 
     # ------------------------------------------------------------------ step 6
     # Compose c_t: marker-derived for qualifying taxa, pi-fallback for

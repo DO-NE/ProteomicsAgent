@@ -436,6 +436,10 @@ class AbundanceEMPlugin(TaxonPlugin):
         if not sc_for_marker:
             sc_for_marker = {p: 1 for p in mapping_result.peptide_list}
 
+        taxon_kingdom = AbundanceEMPlugin._build_taxon_kingdom(
+            mapping_result.taxon_labels
+        )
+
         result = compute_cell_equivalent_abundance(
             pi=model.pi_,
             responsibilities=model.responsibilities_,
@@ -447,10 +451,50 @@ class AbundanceEMPlugin(TaxonPlugin):
             taxon_protein_peptides=mapping_result.taxon_protein_peptides,
             min_marker_families=int(config.get("min_marker_families", 3)),
             min_marker_psms=float(config.get("min_marker_psms", 1.0)),
+            taxon_kingdom=taxon_kingdom,
         )
 
         log_marker_diagnostics(result, logger_obj=logger)
         return result
+
+    @staticmethod
+    def _build_taxon_kingdom(taxon_labels: list) -> dict:
+        """Classify taxon labels into broad kingdoms using name heuristics.
+
+        This is a coarse, keyword-based classifier tuned for the Kleiner
+        FASTA layout (and similar mock-community databases).  Replace with
+        a proper NCBI/GTDB taxonomy lookup if a general solution is needed.
+
+        Rules (checked in order):
+          1. "reinhardtii" or "chlamydomonas" in name → Eukaryota
+          2. "phage", "virus", or "viridae" in name   → Virus
+          3. "nitrososphaera", "viennensis",
+             "thaumarchaeota", "euryarchaeota",
+             "crenarchaeota" in name                  → Archaea
+          4. Everything else                           → Bacteria
+
+        Returns
+        -------
+        dict[str, str]
+            ``taxon_label -> "Bacteria" | "Archaea" | "Eukaryota" | "Virus"``
+        """
+        kingdom_map: dict = {}
+        for label in taxon_labels:
+            name = label.split("|", 1)[-1] if "|" in label else label
+            name_lower = name.lower()
+            if any(kw in name_lower for kw in ("reinhardtii", "chlamydomonas")):
+                kingdom = "Eukaryota"
+            elif any(kw in name_lower for kw in ("phage", "virus", "viridae")):
+                kingdom = "Virus"
+            elif any(kw in name_lower for kw in (
+                "nitrososphaera", "viennensis",
+                "thaumarchaeota", "euryarchaeota", "crenarchaeota",
+            )):
+                kingdom = "Archaea"
+            else:
+                kingdom = "Bacteria"
+            kingdom_map[label] = kingdom
+        return kingdom_map
 
     @staticmethod
     def _write_marker_outputs(result, output_dir) -> None:

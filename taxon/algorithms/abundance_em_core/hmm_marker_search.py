@@ -57,7 +57,9 @@ HMM_PROFILE_HINT = (
 class MarkerSearchResult:
     """Result bundle returned by :func:`run_hmmsearch`."""
 
-    # protein_accession -> (taxon_label, marker_family, e_value, score)
+    # protein_accession -> (taxon_label, [marker_family, ...], e_value, score)
+    # The family list is ordered best-score first; multi-domain proteins
+    # accumulate all matching HMM family names rather than just the best.
     marker_proteins: dict = field(default_factory=dict)
     # taxon_label -> set of marker_family names found in that taxon
     taxon_marker_families: dict = field(default_factory=dict)
@@ -345,10 +347,9 @@ def _aggregate_hits(
     taxon_marker_families: dict = {}
 
     for (target, query), h in best.items():
-        # If the same target hits multiple queries (multi-domain marker),
-        # remember the best by E-value as the canonical family.  Other
-        # families are still recorded in family_proteins so that
-        # downstream counters see all family memberships.
+        # Record all matching family names for multi-domain proteins so
+        # downstream family counters see every membership, not just the
+        # best-scoring one.  The family list is ordered best-score first.
         family_proteins.setdefault(query, set()).add(target)
 
         label = acc_to_label.get(target, "")
@@ -356,8 +357,20 @@ def _aggregate_hits(
             taxon_marker_families.setdefault(label, set()).add(query)
 
         existing = marker_proteins.get(target)
-        if existing is None or h["evalue"] < existing[2]:
-            marker_proteins[target] = (label, query, h["evalue"], h["score"])
+        if existing is None:
+            marker_proteins[target] = (label, [query], h["evalue"], h["score"])
+        else:
+            ex_label, ex_families, ex_evalue, ex_score = existing
+            new_families = list(ex_families)
+            if query not in new_families:
+                if h["evalue"] < ex_evalue:
+                    new_families.insert(0, query)
+                else:
+                    new_families.append(query)
+            if h["evalue"] < ex_evalue:
+                marker_proteins[target] = (ex_label, new_families, h["evalue"], h["score"])
+            else:
+                marker_proteins[target] = (ex_label, new_families, ex_evalue, ex_score)
 
     return MarkerSearchResult(
         marker_proteins=marker_proteins,
