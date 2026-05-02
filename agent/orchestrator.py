@@ -265,6 +265,50 @@ class Orchestrator:
             config["proteome_mass_correction"] = bool(params["proteome_mass_correction"])
         elif proteome_mass_env is not None:
             config["proteome_mass_correction"] = proteome_mass_env.lower() not in ("0", "false", "no")
+
+        # Marker-correction thresholds (optional, env-driven via main.py YAML config).
+        for env_name, key, cast in (
+            ("TAXON_MARKER_MIN_FAMILIES", "min_marker_families", int),
+            ("TAXON_MARKER_MIN_PSMS", "min_marker_psms", float),
+        ):
+            if key in params and params[key] is not None:
+                config[key] = cast(params[key])
+            else:
+                env_val = os.getenv(env_name)
+                if env_val is not None and env_val != "":
+                    config[key] = cast(env_val)
+
+        # EM hyperparameters (optional, env-driven via main.py YAML config).
+        em_env_map = (
+            ("TAXON_EM_ALPHA", "alpha", float),
+            ("TAXON_EM_MAX_ITER", "max_iter", int),
+            ("TAXON_EM_TOL", "tol", float),
+            ("TAXON_EM_N_RESTARTS", "n_restarts", int),
+            ("TAXON_EM_INIT", "init_strategy", str),
+            ("TAXON_EM_ABUNDANCE_THRESHOLD", "min_abundance", float),
+        )
+        for env_name, key, cast in em_env_map:
+            if key in params and params[key] is not None:
+                config[key] = cast(params[key])
+            else:
+                env_val = os.getenv(env_name)
+                if env_val is not None and env_val != "":
+                    config[key] = cast(env_val)
+
+        # Output options (plotting, unified table, PSM-count filter).
+        for env_name, key, cast in (
+            ("TAXON_GENERATE_PLOT", "generate_plot", lambda v: str(v).lower() not in ("0", "false", "no")),
+            ("TAXON_PLOT_TOP_N", "plot_top_n", int),
+            ("TAXON_UNIFIED_TABLE", "unified_table", lambda v: str(v).lower() not in ("0", "false", "no")),
+            ("TAXON_MIN_PSM_THRESHOLD", "min_psm_threshold", int),
+        ):
+            if key in params and params[key] is not None:
+                config[key] = cast(params[key])
+            else:
+                env_val = os.getenv(env_name)
+                if env_val is not None and env_val != "":
+                    config[key] = cast(env_val)
+
         config["output_dir"] = str(self.run_dir)
 
         results = self.taxon_registry.run(algorithm, peptides, config)

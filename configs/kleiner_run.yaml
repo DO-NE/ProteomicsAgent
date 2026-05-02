@@ -1,0 +1,16 @@
+input: /mnt/data3/PXD006118/C1_run3_1mM.mzML
+db: /home/dkwak/data/PXD006118/Mock_Comm_RefDB_V3.fasta
+output_dir: results/kleiner/
+no_llm: true
+min_psm_threshold: 2
+detectability_mode: sequence_features
+prefix_map: /home/dkwak/data/PXD006118/kleiner_prefix_map.tsv
+corrections:
+  proteome_mass:
+    enabled: true
+  marker:
+    enabled: true
+    hmm_profile_dir: data/marker_hmms/
+output:
+  plot: true
+  plot_top_n: 15

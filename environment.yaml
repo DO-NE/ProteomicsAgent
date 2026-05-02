@@ -27,3 +27,5 @@ dependencies:
     - rich>=13.7.0
     - click>=8.1.0
     - huggingface_hub>=0.23.0
+    # YAML run-config files (configs/*.yaml) consumed by main.py --config
+    - pyyaml>=6.0

@@ -1,0 +1,13 @@
+input: /mnt/data3/Real_cocluture_Ancestral_PASAKP/TPP/REPLACE_WITH_MZML.mzML
+db: /home/dkwak/data/PASAKP_decoy.fasta
+output_dir: results/pasakp/
+no_llm: true
+corrections:
+  proteome_mass:
+    enabled: true
+  marker:
+    enabled: true
+    hmm_profile_dir: data/marker_hmms/
+output:
+  plot: true
+  plot_top_n: 10

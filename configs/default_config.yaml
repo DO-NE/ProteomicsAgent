@@ -1,0 +1,39 @@
+# ProteomicsAgent Run Configuration
+# All fields are optional unless marked REQUIRED.
+
+# --- Input/Output (REQUIRED) ---
+input: null                    # Path to .mzML file
+db: null                       # Path to reference FASTA
+output_dir: results/           # Output directory (created if absent)
+
+# --- Pipeline Options ---
+no_llm: true                   # Disable LLM assistance (recommended)
+min_psm_threshold: 2           # Minimum PSMs for a taxon to be reported
+detectability_mode: uniform    # uniform | sequence_features | file
+detectability_file: null       # Path to detectability scores TSV (mode=file only)
+prefix_map: null               # Path to prefix→organism TSV (optional)
+
+# --- Post-EM Corrections ---
+corrections:
+  proteome_mass:
+    enabled: false             # Proteome-size weighted protein-biomass correction
+  marker:
+    enabled: false             # Marker-based cell-equivalent correction
+    hmm_profile_dir: null      # Path to bac120/ar53 HMM profiles directory
+    min_marker_families: 3     # Minimum marker families for estimate
+    min_marker_psms: 1.0       # Minimum fractional marker PSMs
+
+# --- EM Algorithm ---
+em:
+  alpha: 0.5                   # Dirichlet prior hyperparameter
+  max_iter: 500                # Maximum EM iterations
+  tol: 1.0e-6                  # L1 convergence tolerance
+  n_restarts: 1                # Number of random restarts
+  init_strategy: unique        # unique | uniform | random
+  abundance_threshold: 1.0e-4  # Post-convergence zeroing threshold
+
+# --- Output Options ---
+output:
+  plot: true                   # Generate abundance bar chart PNG
+  plot_top_n: 15               # Number of top taxa to show in plot
+  unified_table: true          # Single TSV with all abundance vectors

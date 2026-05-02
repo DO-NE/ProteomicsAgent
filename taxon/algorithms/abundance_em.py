@@ -125,14 +125,25 @@ class AbundanceEMPlugin(TaxonPlugin):
         """
         fasta_path = str(config["fasta_path"])
         pepxml_path = config.get("pepxml_path")
-        exclude_prefixes = config.get("exclude_prefixes", ["DECOY", "contag"])
+        # cRAP common-contaminant entries must never enter the EM — they
+        # otherwise form a "CRAP" taxon that competes with real community
+        # members for PSM mass (header-parsing review, CRITICAL).
+        exclude_prefixes = config.get(
+            "exclude_prefixes", ["DECOY", "contag", "CRAP_", "cRAP_", "crap_"]
+        )
 
         # Plugin parameters with defaults.
         alpha = float(config.get("alpha", 0.5))
         max_iter = int(config.get("max_iter", 500))
         tol = float(config.get("tol", 1e-6))
         n_restarts = int(config.get("n_restarts", 1))
-        min_abundance = float(config.get("min_abundance", 1e-4))
+        # `abundance_threshold` is the YAML / config-file alias for
+        # `min_abundance`; both are accepted for backwards compatibility.
+        min_abundance = float(
+            config.get("min_abundance",
+                       config.get("abundance_threshold", 1e-4))
+        )
+        init_strategy = str(config.get("init_strategy", "unique"))
         enzyme = str(config.get("enzyme", "trypsin"))
         missed_cleavages = int(config.get("missed_cleavages", 2))
         min_length = int(config.get("min_peptide_length", 7))
@@ -145,6 +156,10 @@ class AbundanceEMPlugin(TaxonPlugin):
         prefix_map_file = config.get("prefix_map_file")
         output_dir = config.get("output_dir")
         taxon_level = str(config.get("taxon_level", "species"))
+        min_psm_threshold = int(config.get("min_psm_threshold", 0))
+        generate_plot = bool(config.get("generate_plot", True))
+        plot_top_n = int(config.get("plot_top_n", 15))
+        unified_table = bool(config.get("unified_table", True))
 
         # When a pepXML is available, derive peptides and spectral counts
         # from the PSM-level data instead of the caller-supplied protein list.
@@ -184,9 +199,9 @@ class AbundanceEMPlugin(TaxonPlugin):
 
         # Write unclassified entries to a diagnostic TSV.
         if unclassified_peptides and output_dir:
-            taxon_dir = Path(str(output_dir)) / "taxon"
-            taxon_dir.mkdir(parents=True, exist_ok=True)
-            tsv_path = taxon_dir / "unclassified_entries.tsv"
+            diag_dir = Path(str(output_dir)) / "diagnostics"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            tsv_path = diag_dir / "unclassified_entries.tsv"
             with tsv_path.open("w", encoding="utf-8") as fh:
                 fh.write("peptide_sequence\tprotein_accession\n")
                 for pep, acc in unclassified_peptides:
@@ -282,6 +297,7 @@ class AbundanceEMPlugin(TaxonPlugin):
             tol=tol,
             n_restarts=n_restarts,
             min_abundance=min_abundance,
+            init=init_strategy,
             seed=seed,
             detectability_mode=detectability_mode,
             detectability_file=detectability_file,
@@ -317,9 +333,16 @@ class AbundanceEMPlugin(TaxonPlugin):
         confidences = self._confidences(model.standard_errors_)
         responsibilities = model.responsibilities_
 
+        # Per-taxon total PSM count (sum of y over peptides this taxon can
+        # produce, with non-trivial responsibility). Used both for the
+        # `min_psm_threshold` filter and for the unified output table.
+        taxon_psm_count = self._taxon_psm_counts(A, y, responsibilities)
+
         for col, label in enumerate(taxon_labels):
             abundance = float(model.pi_[col])
             if abundance <= min_abundance:
+                continue
+            if min_psm_threshold > 0 and taxon_psm_count[col] < min_psm_threshold:
                 continue
 
             taxon_id, taxon_name = label.split("|", 1) if "|" in label else ("0", label)
@@ -341,17 +364,44 @@ class AbundanceEMPlugin(TaxonPlugin):
 
         results.sort(key=lambda r: r.abundance, reverse=True)
 
-        # If marker correction was requested, persist its outputs alongside
-        # the main results so downstream tooling can compare PSM-level pi
-        # vs cell-equivalent c.  The TaxonResult records returned to the
-        # caller still carry pi as the abundance — c is reported through
-        # the auxiliary TSV / report files only, to avoid silently
-        # changing the meaning of TaxonResult.abundance.
-        if marker_result is not None and output_dir:
-            self._write_marker_outputs(marker_result, output_dir)
+        # Persist a single unified output TSV containing every available
+        # abundance vector (PSM, biomass, cell-equivalent) plus the marker
+        # / proteome-mass diagnostic columns. This replaces the previous
+        # split between marker_correction_results.tsv and
+        # biomass_correction_results.tsv.
+        if output_dir and unified_table:
+            unified_path = self._write_unified_results(
+                taxon_labels=taxon_labels,
+                taxon_names=[lbl.split("|", 1)[-1] for lbl in taxon_labels],
+                psm_abundance=model.pi_,
+                biomass_result=biomass_result,
+                marker_result=marker_result,
+                output_dir=output_dir,
+                min_abundance=min_abundance,
+                min_psm_threshold=min_psm_threshold,
+                taxon_psm_count=taxon_psm_count,
+            )
 
-        if biomass_result is not None and output_dir:
-            self._write_biomass_results(biomass_result, output_dir)
+            # Diagnostic txt outputs (marker / biomass) live in diagnostics/.
+            self._write_correction_diagnostics(
+                marker_result=marker_result,
+                biomass_result=biomass_result,
+                output_dir=output_dir,
+            )
+
+            # Final step: render the bar-chart PNG.
+            if generate_plot and unified_path is not None:
+                from .abundance_em_core.visualize_results import plot_abundance_results
+
+                plot_path = Path(str(output_dir)) / "abundance_plot.png"
+                try:
+                    plot_abundance_results(
+                        unified_result_path=unified_path,
+                        output_path=plot_path,
+                        top_n=plot_top_n,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never fail a run on a plot
+                    logger.warning("abundance plot failed: %s", exc)
 
         return results
 
@@ -497,39 +547,19 @@ class AbundanceEMPlugin(TaxonPlugin):
         return kingdom_map
 
     @staticmethod
-    def _write_marker_outputs(result, output_dir) -> None:
-        """Write ``marker_correction_results.tsv`` and the diagnostic txt."""
-        from .abundance_em_core.marker_correction import log_marker_diagnostics
+    def _taxon_psm_counts(A, y, responsibilities):
+        """Per-taxon total expected PSM count.
+
+        ``count_t = sum_p y_p * r_{pt}``: weights each peptide's spectral
+        count by the EM responsibility assigned to taxon t. This is the
+        natural fractional-PSM denominator for a min-PSM filter on
+        shared-peptide samples.
+        """
         import numpy as np
 
-        taxon_dir = Path(str(output_dir)) / "taxon"
-        taxon_dir.mkdir(parents=True, exist_ok=True)
-
-        tsv_path = taxon_dir / "marker_correction_results.tsv"
-        order = np.argsort(-result.cell_abundance)
-        with tsv_path.open("w", encoding="utf-8") as fh:
-            fh.write(
-                "taxon_id\ttaxon_name\tpsm_abundance\tcell_abundance\t"
-                "marker_signal\tmarker_families\tmarker_psms\t"
-                "has_marker_estimate\n"
-            )
-            for t in order:
-                lbl = result.taxon_labels[t]
-                tid, tname = lbl.split("|", 1) if "|" in lbl else ("0", lbl)
-                fh.write(
-                    f"{tid}\t{tname}\t"
-                    f"{result.psm_abundance[t]:.6f}\t"
-                    f"{result.cell_abundance[t]:.6f}\t"
-                    f"{result.marker_signal[t]:.4f}\t"
-                    f"{int(result.marker_families_per_taxon[t])}\t"
-                    f"{result.marker_psm_count[t]:.4f}\t"
-                    f"{int(bool(result.has_marker_estimate[t]))}\n"
-                )
-
-        diag_path = taxon_dir / "marker_diagnostics.txt"
-        report = log_marker_diagnostics(result)
-        diag_path.write_text(report, encoding="utf-8")
-        logger.info("Marker correction outputs: %s, %s", tsv_path, diag_path)
+        y_arr = np.asarray(y, dtype=np.float64)
+        r = np.asarray(responsibilities, dtype=np.float64)
+        return (y_arr[:, np.newaxis] * r).sum(axis=0)
 
     # ------------------------------------------------- proteome-mass correction
 
@@ -563,26 +593,125 @@ class AbundanceEMPlugin(TaxonPlugin):
             return None
 
     @staticmethod
-    def _write_biomass_results(result, output_dir) -> None:
-        """Write ``biomass_correction_results.tsv`` to the taxon output dir."""
+    def _write_unified_results(
+        taxon_labels: list,
+        taxon_names: list,
+        psm_abundance,
+        biomass_result,
+        marker_result,
+        output_dir,
+        min_abundance: float = 0.0,
+        min_psm_threshold: int = 0,
+        taxon_psm_count=None,
+    ):
+        """Write the single unified ``abundance_results.tsv``.
+
+        Columns: ``taxon_id, taxon_name, psm_abundance, biomass_abundance,
+        cell_abundance, proteome_size, marker_families, marker_psms,
+        has_marker_estimate``.
+
+        - ``biomass_abundance`` mirrors ``psm_abundance`` when proteome-mass
+          correction was not run.
+        - ``cell_abundance`` mirrors ``psm_abundance`` when marker correction
+          was not run.
+        - cRAP contaminant rows are dropped (defensive — they are excluded
+          from the EM upstream, but a hand-edited mapping could in theory
+          let one slip through).
+        - Sorted by ``psm_abundance`` descending.
+        """
         import numpy as np
 
-        taxon_dir = Path(str(output_dir)) / "taxon"
-        taxon_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(str(output_dir))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tsv_path = out_dir / "abundance_results.tsv"
 
-        tsv_path = taxon_dir / "biomass_correction_results.tsv"
-        order = np.argsort(-result.biomass_abundance)
+        psm = np.asarray(psm_abundance, dtype=np.float64)
+        T = psm.shape[0]
+
+        if biomass_result is not None:
+            biomass = np.asarray(biomass_result.biomass_abundance, dtype=np.float64)
+            proteome_sizes = np.asarray(biomass_result.proteome_sizes, dtype=np.int64)
+        else:
+            biomass = psm.copy()
+            proteome_sizes = np.zeros(T, dtype=np.int64)
+
+        if marker_result is not None:
+            cell = np.asarray(marker_result.cell_abundance, dtype=np.float64)
+            marker_families = np.asarray(
+                marker_result.marker_families_per_taxon, dtype=np.int64
+            )
+            marker_psms = np.asarray(marker_result.marker_psm_count, dtype=np.float64)
+            has_marker = np.asarray(marker_result.has_marker_estimate, dtype=bool)
+        else:
+            cell = psm.copy()
+            marker_families = np.zeros(T, dtype=np.int64)
+            marker_psms = np.zeros(T, dtype=np.float64)
+            has_marker = np.zeros(T, dtype=bool)
+
+        order = np.argsort(-psm)
+        n_written = 0
         with tsv_path.open("w", encoding="utf-8") as fh:
             fh.write(
-                "taxon_id\ttaxon_name\tpsm_abundance\tbiomass_abundance\tproteome_size\n"
+                "taxon_id\ttaxon_name\tpsm_abundance\tbiomass_abundance\t"
+                "cell_abundance\tproteome_size\tmarker_families\t"
+                "marker_psms\thas_marker_estimate\n"
             )
             for t in order:
-                lbl = result.taxon_labels[t]
+                lbl = taxon_labels[t]
                 tid, tname = lbl.split("|", 1) if "|" in lbl else ("0", lbl)
+                # Drop cRAP rows — they should never be in the matrix, but
+                # if a future change weakens the upstream filter we still
+                # do not want them in the published table.
+                if "crap" in str(tname).lower() or str(tid).lower().startswith("crap"):
+                    continue
+                if psm[t] <= min_abundance:
+                    continue
+                if (
+                    min_psm_threshold > 0
+                    and taxon_psm_count is not None
+                    and taxon_psm_count[t] < min_psm_threshold
+                ):
+                    continue
                 fh.write(
                     f"{tid}\t{tname}\t"
-                    f"{result.psm_abundance[t]:.6f}\t"
-                    f"{result.biomass_abundance[t]:.6f}\t"
-                    f"{int(result.proteome_sizes[t])}\n"
+                    f"{psm[t]:.6f}\t"
+                    f"{biomass[t]:.6f}\t"
+                    f"{cell[t]:.6f}\t"
+                    f"{int(proteome_sizes[t])}\t"
+                    f"{int(marker_families[t])}\t"
+                    f"{marker_psms[t]:.4f}\t"
+                    f"{int(bool(has_marker[t]))}\n"
                 )
-        logger.info("Biomass correction output: %s", tsv_path)
+                n_written += 1
+        logger.info(
+            "Unified abundance results: %s (%d rows)", tsv_path, n_written,
+        )
+        return tsv_path
+
+    @staticmethod
+    def _write_correction_diagnostics(
+        marker_result,
+        biomass_result,
+        output_dir,
+    ) -> None:
+        """Write the human-readable correction reports under ``diagnostics/``.
+
+        These are descriptive text files (not data); the per-taxon numeric
+        breakdown lives in the unified ``abundance_results.tsv``.
+        """
+        diag_dir = Path(str(output_dir)) / "diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+
+        if marker_result is not None:
+            from .abundance_em_core.marker_correction import log_marker_diagnostics
+
+            text = log_marker_diagnostics(marker_result)
+            (diag_dir / "marker_diagnostics.txt").write_text(text, encoding="utf-8")
+
+        if biomass_result is not None:
+            from .abundance_em_core.proteome_mass_correction import (
+                log_proteome_mass_diagnostics,
+            )
+
+            text = log_proteome_mass_diagnostics(biomass_result)
+            (diag_dir / "biomass_diagnostics.txt").write_text(text, encoding="utf-8")
