@@ -1,29 +1,31 @@
 """
-Proteome-mass correction for taxon abundance estimation.
+Genome-normalized cell-number abundance correction for taxon abundance estimation.
 
-Converts PSM-level relative abundance (π_t) from AbundanceEM into
-protein-biomass-level relative abundance (b_t) by weighting each
-taxon's PSM fraction by its proteome size W_t.
+Converts PSM-level relative abundance (π_t) from AbundanceEM into a
+genome-normalized cell-number abundance (b_t) by dividing each taxon's
+PSM fraction by its proteome capacity W_t.
 
 Theory
 ------
-PSM-level abundance overestimates taxa with large proteomes because
-more proteins → more tryptic peptides → more PSMs per cell.
-Multiplying π_t by W_t (number of proteins in the reference FASTA
-for taxon t) approximately corrects for this bias:
+Under the Total Protein Approach (TPA), π_t is already directly
+proportional to taxon t's protein-biomass contribution — no upward
+correction is needed at the biomass level.  However, larger genomes
+correspond to larger cells with proportionally more protein per cell,
+so dividing biomass by proteome capacity yields a cell-number estimate:
 
-    b_t ∝ π_t × W_t
+    b_t ∝ π_t / W_t
 
-For multi-strain taxa sharing a FASTA prefix (e.g. three Salmonella
-strains all prefixed LT2_), W_t automatically reflects the combined
-proteome size, which is a key advantage over external database lookups.
+This is the proteomic analogue of the cell-volume normalization used in
+Pible et al. 2020 Microbiome, with proteome capacity (protein count from
+the reference FASTA) replacing cell volume as a genome-derived per-cell
+protein proxy.
 
 W_t is computed directly from the MappingMatrixResult, which already
 parsed the FASTA and knows which proteins belong to which taxon.
 No external database, no genome size lookup, no network access needed.
 
-Reference: Kleiner et al. 2017 Nat. Commun. (iBAQ baseline);
-           Wiśniewski & Mann 2014 (Proteomic Ruler concept).
+Reference: Pible et al. 2020 Microbiome (cell-volume normalization);
+           Kleiner et al. 2017 Nat. Commun. (TPA baseline).
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ class ProteomeMassCorrectionResult:
     # Taxon labels matching column order
     taxon_labels: list[str]
 
-    # Unnormalized weighted values (π_t × W_t) before normalization
+    # Unnormalized weighted values (π_t / W_t) before normalization
     weighted_signal: np.ndarray
 
     # Diagnostics
@@ -86,9 +88,12 @@ def compute_proteome_sizes(
     Notes
     -----
     W_t counts the number of PROTEIN ENTRIES per taxon in the FASTA,
-    not the number of unique peptides. This is the correct denominator
-    because it reflects proteome size (total number of expressed gene
-    products), analogous to the iBAQ denominator at the protein level.
+    not the number of unique peptides.  It serves as a genome-derived
+    proxy for per-cell proteome capacity: taxa whose reference FASTA
+    contains more proteins are assumed to have proportionally more
+    protein per cell.  Dividing π_t by W_t therefore converts
+    protein-biomass abundance into a genome-normalized cell-number
+    estimate.
 
     For taxa with zero proteins (should not happen but handle gracefully),
     W_t is set to 1 to avoid division by zero.
@@ -112,14 +117,15 @@ def compute_biomass_abundance(
     taxon_labels: list[str],
 ) -> ProteomeMassCorrectionResult:
     """
-    Compute protein-biomass relative abundance via proteome-size weighting.
+    Compute genome-normalized cell-number abundance via proteome-size division.
 
     Parameters
     ----------
     pi : np.ndarray, shape (T,)
         PSM-level abundance from AbundanceEM (sums to 1).
     proteome_sizes : np.ndarray, shape (T,)
-        W_t values from compute_proteome_sizes().
+        W_t values from compute_proteome_sizes().  Any zero entries are
+        replaced with 1 locally to prevent division by zero.
     taxon_labels : list[str]
         Taxon labels in the same order as pi and proteome_sizes.
 
@@ -129,28 +135,34 @@ def compute_biomass_abundance(
 
     Algorithm
     ---------
-    1. Compute weighted signal: w_t = π_t × W_t
-    2. Normalize: b_t = w_t / Σ w_t
-    3. Return ProteomeMassCorrectionResult with all fields populated.
+    1. Guard against zero proteome sizes (W_t = 0 → W_t = 1).
+    2. Compute weighted signal: w_t = π_t / W_t
+    3. Normalize: b_t = w_t / Σ w_t
+    4. Return ProteomeMassCorrectionResult with all fields populated.
     """
     pi = np.asarray(pi, dtype=np.float64)
     proteome_sizes = np.asarray(proteome_sizes, dtype=np.float64)
 
-    weighted = pi * proteome_sizes
+    # Guard: zero proteome size → fall back to W_t = 1 (taxa with no FASTA
+    # entries are treated as if they have a single-protein genome so that
+    # π_t is returned unchanged for those taxa after normalization).
+    sizes_safe = np.where(proteome_sizes == 0, 1.0, proteome_sizes)
+
+    weighted = pi / sizes_safe
     total = float(weighted.sum())
     if total > 0:
         biomass = weighted / total
     else:
         logger.warning(
             "Proteome-mass correction: weighted signal sums to zero; "
-            "returning uniform biomass abundance"
+            "returning uniform cell-number abundance"
         )
         T = len(pi)
         biomass = np.full(T, 1.0 / T) if T > 0 else np.zeros(0)
 
     sizes_int = proteome_sizes.astype(np.int64)
     return ProteomeMassCorrectionResult(
-        biomass_abundance=biomass,
+        biomass_abundance=biomass,   # column name kept for backwards compatibility
         psm_abundance=pi.copy(),
         proteome_sizes=proteome_sizes.copy(),
         taxon_labels=list(taxon_labels),
@@ -167,17 +179,17 @@ def log_proteome_mass_diagnostics(
     logger=None,
 ) -> str:
     """
-    Generate diagnostic report for proteome-mass correction.
+    Generate diagnostic report for genome-normalized cell-number correction.
 
     Reports:
     - Proteome size range (min, max, median across taxa)
-    - Top taxa by biomass abundance vs PSM abundance (to highlight corrections)
+    - Top taxa by cell-number abundance vs PSM abundance (to highlight corrections)
     - Largest absolute shifts: taxa where b_t differs most from π_t
 
     Returns report as string, also logs if logger provided.
     """
     lines: list[str] = []
-    lines.append("=== Proteome-Mass Correction ===")
+    lines.append("=== Genome-Normalized Cell-Number Correction ===")
     lines.append(
         f"Taxa: {result.n_taxa}  |  "
         f"Proteome sizes — min: {result.min_proteome_size}, "
@@ -209,7 +221,7 @@ def log_proteome_mass_diagnostics(
     shifts = np.abs(result.biomass_abundance - result.psm_abundance)
     shift_order = np.argsort(-shifts)
     lines.append("")
-    lines.append("Largest corrections (|b_t - π_t|):")
+    lines.append("Largest cell-number corrections (|b_t - π_t|):")
     for rank, t in enumerate(shift_order[:10]):
         if shifts[t] < 1e-6:
             break

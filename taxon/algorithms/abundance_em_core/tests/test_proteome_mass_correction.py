@@ -2,9 +2,9 @@
 Tests for proteome_mass_correction module.
 
 Test cases:
-1. Basic correction: 3 taxa with known pi and W_t, verify b_t = normalize(pi * W).
-2. Multi-strain effect: two taxa with same-size genomes but one has 3x more
-   proteins in FASTA (simulating multi-strain). Verify that taxon gets 3x boost.
+1. Basic correction: 3 taxa with known pi and W_t, verify b_t = normalize(pi / W).
+2. Multi-strain correction: two taxa with equal pi but one has 3x more proteins
+   in FASTA. Verify that taxon gets its abundance scaled DOWN by 3x (not boosted).
 3. Equal proteome sizes: if all W_t are equal, b_t should equal pi_t.
 4. Zero proteome size: handle gracefully (W_t = 1 fallback), no crash.
 5. Integration with MappingMatrixResult: verify compute_proteome_sizes()
@@ -99,15 +99,15 @@ class TestComputeProteomeSizes:
 
 class TestComputeBiomassAbundance:
     def test_basic_correction(self):
-        """b_t = normalize(pi * W_t) for 3 taxa with known values."""
+        """b_t = normalize(pi / W_t) for 3 taxa with known values."""
         pi = np.array([0.5, 0.3, 0.2])
         W = np.array([100.0, 200.0, 50.0])
         labels = ["A|TaxA", "B|TaxB", "C|TaxC"]
 
         result = compute_biomass_abundance(pi, W, labels)
 
-        weighted = pi * W          # [50, 60, 10]
-        expected = weighted / weighted.sum()   # [0.4167, 0.5, 0.0833]
+        weighted = pi / W          # [0.005, 0.0015, 0.004]
+        expected = weighted / weighted.sum()
 
         np.testing.assert_allclose(result.biomass_abundance, expected, atol=1e-10)
         np.testing.assert_allclose(result.biomass_abundance.sum(), 1.0, atol=1e-10)
@@ -122,11 +122,16 @@ class TestComputeBiomassAbundance:
 
         np.testing.assert_allclose(result.biomass_abundance, pi, atol=1e-12)
 
-    def test_multistrain_boost(self):
-        """Taxon with 3x more proteins in FASTA gets 3x boost relative to the other.
+    def test_multistrain_correction(self):
+        """Taxon with 3x more proteins in FASTA gets its abundance scaled DOWN by 3x.
+
+        Under the TPA / genome-normalized formula (b_t ∝ π_t / W_t), a larger
+        proteome means a larger cell with more protein per cell, so the same
+        PSM abundance represents fewer cells.
 
         Two taxa with pi=[0.5, 0.5] but W=[3000, 1000].
-        Expected: b = [0.75, 0.25].
+        weighted = [0.5/3000, 0.5/1000] = [1/6000, 1/2000]
+        normalised = [1/4, 3/4] = [0.25, 0.75].
         """
         pi = np.array([0.5, 0.5])
         W = np.array([3000.0, 1000.0])
@@ -134,8 +139,8 @@ class TestComputeBiomassAbundance:
 
         result = compute_biomass_abundance(pi, W, labels)
 
-        np.testing.assert_allclose(result.biomass_abundance[0], 0.75, atol=1e-10)
-        np.testing.assert_allclose(result.biomass_abundance[1], 0.25, atol=1e-10)
+        np.testing.assert_allclose(result.biomass_abundance[0], 0.25, atol=1e-10)
+        np.testing.assert_allclose(result.biomass_abundance[1], 0.75, atol=1e-10)
 
     def test_result_fields_populated(self):
         """All dataclass fields on ProteomeMassCorrectionResult are set."""
@@ -152,7 +157,7 @@ class TestComputeBiomassAbundance:
         np.testing.assert_array_equal(result.psm_abundance, pi)
         np.testing.assert_array_equal(result.proteome_sizes, W)
         np.testing.assert_array_equal(result.taxon_labels, labels)
-        np.testing.assert_allclose(result.weighted_signal, pi * W)
+        np.testing.assert_allclose(result.weighted_signal, pi / W)
 
     def test_zero_pi_taxon(self):
         """A taxon with pi=0 should also have b=0 regardless of W_t."""
@@ -187,7 +192,7 @@ class TestLogProteomeMassDiagnostics:
 
         assert isinstance(report, str)
         assert len(report) > 0
-        assert "Proteome-Mass Correction" in report
+        assert "Genome-Normalized Cell-Number Correction" in report
 
     def test_report_contains_taxa_names(self):
         """The report should show taxon names from the labels."""
@@ -224,6 +229,6 @@ class TestIntegrationWithTaxonProteinPeptides:
         result = compute_biomass_abundance(pi, sizes, labels)
 
         # W = [500, 250], pi = [0.5, 0.5]
-        # weighted = [250, 125], normalized = [2/3, 1/3]
-        np.testing.assert_allclose(result.biomass_abundance[0], 2 / 3, atol=1e-10)
-        np.testing.assert_allclose(result.biomass_abundance[1], 1 / 3, atol=1e-10)
+        # weighted = [0.5/500, 0.5/250] = [0.001, 0.002], normalized = [1/3, 2/3]
+        np.testing.assert_allclose(result.biomass_abundance[0], 1 / 3, atol=1e-10)
+        np.testing.assert_allclose(result.biomass_abundance[1], 2 / 3, atol=1e-10)

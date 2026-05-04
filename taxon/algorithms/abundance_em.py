@@ -611,7 +611,10 @@ class AbundanceEMPlugin(TaxonPlugin):
         has_marker_estimate``.
 
         - ``biomass_abundance`` mirrors ``psm_abundance`` when proteome-mass
-          correction was not run.
+          correction was not run.  When correction is run, this column holds
+          genome-normalized cell-number abundance (π_t / W_t, normalised).
+          The column name is kept as ``biomass_abundance`` for backwards
+          compatibility with existing downstream scripts.
         - ``cell_abundance`` mirrors ``psm_abundance`` when marker correction
           was not run.
         - cRAP contaminant rows are dropped (defensive — they are excluded
