@@ -419,6 +419,26 @@ Each stage is implemented as a `PipelineStage` subclass in `pipeline/`. Stages a
 
 The default search engine is MSFragger; switch to Comet by passing `{"tool": "comet"}` as action params in the interactive session, or set the `tool` key in `--no-llm` mode params.
 
+#### PSM probability threshold (dynamic, FDR-based)
+
+After PeptideProphet runs, the pipeline extracts a dataset-specific PSM probability threshold from the `<error_point>` elements embedded in the pepXML ROC curve rather than using a hardcoded value. The threshold corresponds to the largest error rate that does not exceed the configured target FDR.
+
+```
+<error_point error="0.0100" min_prob="0.7846" num_corr="261803" num_incorr="2645"/>
+```
+
+The extracted `min_prob` is applied when parsing PSMs for taxon inference. If no `<error_point>` elements are present (e.g. older TPP versions), a fallback of 0.90 is used with a warning.
+
+Control the target FDR via:
+
+| Method | Example |
+|---|---|
+| CLI flag | `--target-fdr 0.01` |
+| YAML config | `target_fdr: 0.01` |
+| Environment variable | `TAXON_TARGET_FDR=0.01` |
+
+Default is `0.01` (1% FDR).
+
 ---
 
 ## 9. Taxon inference plugins

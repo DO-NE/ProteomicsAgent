@@ -44,6 +44,7 @@ _ENV_VAR_MAP: dict[str, str] = {
     "init_strategy": "TAXON_EM_INIT",
     "abundance_threshold": "TAXON_EM_ABUNDANCE_THRESHOLD",
     "min_psm_threshold": "TAXON_MIN_PSM_THRESHOLD",
+    "target_fdr": "TAXON_TARGET_FDR",
     "generate_plot": "TAXON_GENERATE_PLOT",
     "plot_top_n": "TAXON_PLOT_TOP_N",
     "unified_table": "TAXON_UNIFIED_TABLE",
@@ -57,7 +58,7 @@ def _flatten_yaml_config(raw: dict) -> dict[str, Any]:
 
     for key in (
         "input", "db", "output_dir", "no_llm", "min_psm_threshold",
-        "detectability_mode", "detectability_file",
+        "target_fdr", "detectability_mode", "detectability_file",
     ):
         if key in raw and raw[key] is not None:
             flat[key] = raw[key]
@@ -166,7 +167,7 @@ def _serialize_run_config(config: dict[str, Any], path: Path) -> None:
 
     for key in (
         "input", "db", "output_dir", "no_llm", "min_psm_threshold",
-        "detectability_mode", "detectability_file",
+        "target_fdr", "detectability_mode", "detectability_file",
         "taxon_level", "resolve_uniprot",
     ):
         if key in flat:
@@ -393,6 +394,17 @@ def cli() -> None:
     default=None,
     help="Minimum PSMs for a taxon to be reported.",
 )
+@click.option(
+    "--target-fdr",
+    "target_fdr",
+    type=float,
+    default=None,
+    help=(
+        "Target FDR for PSM filtering via PeptideProphet ROC curve (default 0.01). "
+        "The corresponding min_prob threshold is extracted automatically from the "
+        "pepXML <error_point> elements after PeptideProphet runs."
+    ),
+)
 def run_cmd(
     config_path: Path | None,
     input_path: Path | None,
@@ -409,6 +421,7 @@ def run_cmd(
     hmm_profile_dir: Path | None,
     proteome_mass_correction: bool | None,
     min_psm_threshold: int | None,
+    target_fdr: float | None,
 ) -> None:
     """Start a new run or resume latest if user confirms."""
 
@@ -426,6 +439,7 @@ def run_cmd(
         "hmm_profile_dir": str(hmm_profile_dir) if hmm_profile_dir else None,
         "proteome_mass_correction": proteome_mass_correction,
         "min_psm_threshold": min_psm_threshold,
+        "target_fdr": target_fdr,
     }
 
     config = load_config(config_path, cli_overrides)
@@ -611,6 +625,17 @@ def start_server_cmd() -> None:
     default=None,
     help="Minimum PSMs for a taxon to be reported.",
 )
+@click.option(
+    "--target-fdr",
+    "target_fdr",
+    type=float,
+    default=None,
+    help=(
+        "Target FDR for PSM filtering via PeptideProphet ROC curve (default 0.01). "
+        "The corresponding min_prob threshold is extracted automatically from the "
+        "pepXML <error_point> elements after PeptideProphet runs."
+    ),
+)
 def run_pipeline_cmd(
     config_path: Path | None,
     input_path: Path | None,
@@ -625,6 +650,7 @@ def run_pipeline_cmd(
     hmm_profile_dir: Path | None,
     proteome_mass_correction: bool | None,
     min_psm_threshold: int | None,
+    target_fdr: float | None,
 ) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
@@ -642,6 +668,7 @@ def run_pipeline_cmd(
         "hmm_profile_dir": str(hmm_profile_dir) if hmm_profile_dir else None,
         "proteome_mass_correction": proteome_mass_correction,
         "min_psm_threshold": min_psm_threshold,
+        "target_fdr": target_fdr,
     }
 
     config = load_config(config_path, cli_overrides)

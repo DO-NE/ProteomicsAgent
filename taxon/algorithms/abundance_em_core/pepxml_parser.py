@@ -19,6 +19,7 @@ _DEFAULT_EXCLUDE_PREFIXES = ["DECOY", "contag"]
 def parse_pepxml(
     pepxml_path: str,
     exclude_prefixes: list[str] | None = None,
+    min_probability: float | None = None,
 ) -> tuple[dict[str, int], dict[str, set[str]]]:
     """Extract peptide spectral counts and protein mappings from a pepXML file.
 
@@ -28,6 +29,10 @@ def parse_pepxml(
         Path to the validated pepXML file.
     exclude_prefixes : list of str, optional
         Protein-accession prefixes to exclude (default ``["DECOY", "contag"]``).
+    min_probability : float, optional
+        When set, only PSMs whose PeptideProphet probability is >= this value
+        are counted. Pass ``None`` (the default) to skip probability filtering
+        and let the upstream validation stage handle it.
 
     Returns
     -------
@@ -47,6 +52,7 @@ def parse_pepxml(
     spectral_counts: dict[str, int] = {}
     peptide_protein_map: dict[str, set[str]] = {}
     n_total = 0
+    n_low_prob = 0
     n_excluded = 0
 
     for event, elem in ET.iterparse(str(path), events=["end"]):
@@ -63,6 +69,12 @@ def parse_pepxml(
                 continue
 
             n_total += 1
+
+            if min_probability is not None:
+                prob = _get_peptideprophet_probability(elem)
+                if prob is None or prob < min_probability:
+                    n_low_prob += 1
+                    continue
 
             # Collect primary + alternative proteins.
             all_proteins: set[str] = set()
@@ -93,15 +105,30 @@ def parse_pepxml(
             elem.clear()
 
     logger.info(
-        "Parsed pepXML: %d rank-1 PSMs, %d excluded (decoy/contaminant), "
-        "%d unique peptides, %d unique proteins",
+        "Parsed pepXML: %d rank-1 PSMs, %d below probability threshold, "
+        "%d excluded (decoy/contaminant), %d unique peptides, %d unique proteins",
         n_total,
+        n_low_prob,
         n_excluded,
         len(spectral_counts),
         len({p for prots in peptide_protein_map.values() for p in prots}),
     )
 
     return spectral_counts, peptide_protein_map
+
+
+def _get_peptideprophet_probability(search_hit: ET.Element) -> float | None:
+    """Return the PeptideProphet probability from a search_hit element, or None."""
+    for child in search_hit:
+        if _local_tag(child.tag) == "analysis_result":
+            if child.get("analysis") == "peptideprophet":
+                for grandchild in child:
+                    if _local_tag(grandchild.tag) == "peptideprophet_result":
+                        try:
+                            return float(grandchild.get("probability", ""))
+                        except (ValueError, TypeError):
+                            return None
+    return None
 
 
 def _local_tag(tag: str) -> str:

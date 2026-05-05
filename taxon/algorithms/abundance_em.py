@@ -161,6 +161,9 @@ class AbundanceEMPlugin(TaxonPlugin):
         plot_top_n = int(config.get("plot_top_n", 15))
         unified_table = bool(config.get("unified_table", True))
 
+        min_probability_raw = config.get("min_probability")
+        min_probability = float(min_probability_raw) if min_probability_raw is not None else None
+
         # When a pepXML is available, derive peptides and spectral counts
         # from the PSM-level data instead of the caller-supplied protein list.
         pepxml_protein_map = None
@@ -168,7 +171,9 @@ class AbundanceEMPlugin(TaxonPlugin):
             from .abundance_em_core.pepxml_parser import parse_pepxml
 
             spectral_counts, pepxml_protein_map = parse_pepxml(
-                pepxml_path, exclude_prefixes=exclude_prefixes,
+                pepxml_path,
+                exclude_prefixes=exclude_prefixes,
+                min_probability=min_probability,
             )
             peptides = list(spectral_counts.keys())
         else:

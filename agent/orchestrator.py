@@ -206,6 +206,17 @@ class Orchestrator:
         peptides: list[str] = []
         spectral_counts: dict[str, int] = {}
 
+        # Derive FDR-based probability threshold from PeptideProphet ROC curve.
+        from pipeline.validation import extract_fdr_threshold
+        target_fdr = float(
+            params.get("target_fdr")
+            or os.getenv("TAXON_TARGET_FDR")
+            or "0.01"
+        )
+        min_probability: float | None = None
+        if pepxml_path and Path(pepxml_path).exists():
+            min_probability = extract_fdr_threshold(str(pepxml_path), target_fdr=target_fdr)
+
         if pepxml_path and Path(pepxml_path).exists():
             import xml.etree.ElementTree as ET
             tree = ET.parse(pepxml_path)
@@ -213,7 +224,25 @@ class Orchestrator:
             ns = root.tag.split("}")[0].strip("{") if root.tag.startswith("{") else ""
             def q(name):
                 return f"{{{ns}}}{name}" if ns else name
+
+            def _strip_ns(tag: str) -> str:
+                return tag.rsplit("}", 1)[1] if "}" in tag else tag
+
             for hit in root.iter(q("search_hit")):
+                if hit.attrib.get("hit_rank", "1") != "1":
+                    continue
+                if min_probability is not None:
+                    prob: float | None = None
+                    for ar in hit:
+                        if _strip_ns(ar.tag) == "analysis_result" and ar.get("analysis") == "peptideprophet":
+                            for pp in ar:
+                                if _strip_ns(pp.tag) == "peptideprophet_result":
+                                    try:
+                                        prob = float(pp.get("probability", ""))
+                                    except (ValueError, TypeError):
+                                        pass
+                    if prob is None or prob < min_probability:
+                        continue
                 pep = hit.attrib.get("peptide", "")
                 if pep:
                     peptides.append(pep)
@@ -232,6 +261,8 @@ class Orchestrator:
             "database_path": params.get("database_path", self.state.database_path),
             "spectral_counts": spectral_counts,
         }
+        if min_probability is not None:
+            config["min_probability"] = min_probability
 
         detectability_mode = params.get("detectability_mode") or os.getenv("TAXON_DETECTABILITY_MODE")
         if detectability_mode:
