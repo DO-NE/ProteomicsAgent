@@ -307,13 +307,33 @@ class AbundanceEMPlugin(TaxonPlugin):
             detectability_mode=detectability_mode,
             detectability_file=detectability_file,
         )
-        model.fit(A, y, peptide_sequences=peptide_list)
+        model.fit(A, y, peptide_sequences=peptide_list, taxon_labels=taxon_labels)
         logger.info(
             "AbundanceEM converged=%s in %d iterations (final lp=%.4f)",
             model.converged_,
             model.n_iter_,
             model.log_posterior_history_[-1] if model.log_posterior_history_ else float("nan"),
         )
+
+        # --- Matrix visualization for degeneracy analysis (opt-in) ---
+        if config.get("visualize_matrices") and output_dir:
+            try:
+                from .abundance_em_core.matrix_visualization import (
+                    visualize_and_export_matrices,
+                )
+
+                visualize_and_export_matrices(
+                    A=model.A_,
+                    M=model.M_,
+                    W=model.W_,
+                    peptide_list=model.peptide_list_ or peptide_list,
+                    taxon_labels=model.taxon_labels_ or taxon_labels,
+                    y=model._y,
+                    output_dir=output_dir,
+                    pi=model.pi_,
+                )
+            except Exception as exc:  # noqa: BLE001 — never fail a run on diagnostics
+                logger.warning("Matrix visualization failed: %s", exc)
 
         # --- Marker-based cell-equivalent correction (Cycle 5, opt-in) ---
         marker_result = None

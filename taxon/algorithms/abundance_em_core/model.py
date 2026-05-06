@@ -114,6 +114,17 @@ class AbundanceEM:
     fisher_singular_ : bool
         True if the observed information matrix was rank-deficient and a
         pseudoinverse was used.
+    A_ : np.ndarray, shape ``(P, T)``
+        Binary mapping matrix stored after ``fit()``.
+    M_ : np.ndarray, shape ``(P, T)``
+        Uniform emission matrix stored after ``fit()``.
+    W_ : np.ndarray, shape ``(P, T)``
+        Emission matrix used in EM (detectability-weighted, or equal to M_
+        when ``detectability_mode='uniform'``).
+    peptide_list_ : list of str or None
+        Peptide sequences (row labels), if passed to ``fit()``.
+    taxon_labels_ : list of str or None
+        Taxon labels (column labels), if passed to ``fit()``.
     """
 
     def __init__(
@@ -177,6 +188,13 @@ class AbundanceEM:
         self.standard_errors_: Optional[np.ndarray] = None
         self.fisher_singular_: bool = False
 
+        # Public post-fit matrix attributes.
+        self.A_: Optional[np.ndarray] = None
+        self.M_: Optional[np.ndarray] = None
+        self.W_: Optional[np.ndarray] = None
+        self.peptide_list_: Optional[list] = None
+        self.taxon_labels_: Optional[list] = None
+
         # Cached internals (not part of public API).
         self._A: Optional[np.ndarray] = None
         self._M: Optional[np.ndarray] = None
@@ -191,6 +209,7 @@ class AbundanceEM:
         A: np.ndarray,
         y: np.ndarray,
         peptide_sequences: Optional[list] = None,
+        taxon_labels: Optional[list] = None,
     ) -> "AbundanceEM":
         """Fit the model.
 
@@ -207,6 +226,10 @@ class AbundanceEM:
             ``detectability_mode='sequence_features'``. If ``None`` and mode
             is not ``'uniform'``, falls back to uniform emission with a
             warning (unless ``detectability_weights`` was provided directly).
+            Stored in ``self.peptide_list_`` after fitting.
+        taxon_labels : list of str or None, optional
+            Taxon column labels in the same order as columns of A.
+            Stored in ``self.taxon_labels_`` after fitting.
 
         Returns
         -------
@@ -266,6 +289,11 @@ class AbundanceEM:
             self._M = M
             self._W = W
             self._y = y_arr
+            self.A_ = A_bin
+            self.M_ = M
+            self.W_ = W
+            self.peptide_list_ = list(peptide_sequences) if peptide_sequences is not None else None
+            self.taxon_labels_ = list(taxon_labels) if taxon_labels is not None else None
             self.pi_ = pi
             self.responsibilities_ = responsibilities
             self.log_posterior_history_ = [self._log_posterior(pi, W, y_arr)]
@@ -314,6 +342,11 @@ class AbundanceEM:
         self._M = M
         self._W = W
         self._y = y_arr
+        self.A_ = A_bin
+        self.M_ = M
+        self.W_ = W
+        self.peptide_list_ = list(peptide_sequences) if peptide_sequences is not None else None
+        self.taxon_labels_ = list(taxon_labels) if taxon_labels is not None else None
         self.pi_ = pi
         self.responsibilities_ = responsibilities
         self.log_posterior_history_ = best.log_posterior_history

@@ -326,12 +326,14 @@ class Orchestrator:
                 if env_val is not None and env_val != "":
                     config[key] = cast(env_val)
 
-        # Output options (plotting, unified table, PSM-count filter).
+        # Output options (plotting, unified table, PSM-count filter, matrix viz).
+        _bool_env = lambda v: str(v).lower() not in ("0", "false", "no")  # noqa: E731
         for env_name, key, cast in (
-            ("TAXON_GENERATE_PLOT", "generate_plot", lambda v: str(v).lower() not in ("0", "false", "no")),
+            ("TAXON_GENERATE_PLOT", "generate_plot", _bool_env),
             ("TAXON_PLOT_TOP_N", "plot_top_n", int),
-            ("TAXON_UNIFIED_TABLE", "unified_table", lambda v: str(v).lower() not in ("0", "false", "no")),
+            ("TAXON_UNIFIED_TABLE", "unified_table", _bool_env),
             ("TAXON_MIN_PSM_THRESHOLD", "min_psm_threshold", int),
+            ("TAXON_VISUALIZE_MATRICES", "visualize_matrices", _bool_env),
         ):
             if key in params and params[key] is not None:
                 config[key] = cast(params[key])

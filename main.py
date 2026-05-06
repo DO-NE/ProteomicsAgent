@@ -48,6 +48,7 @@ _ENV_VAR_MAP: dict[str, str] = {
     "generate_plot": "TAXON_GENERATE_PLOT",
     "plot_top_n": "TAXON_PLOT_TOP_N",
     "unified_table": "TAXON_UNIFIED_TABLE",
+    "visualize_matrices": "TAXON_VISUALIZE_MATRICES",
 }
 
 
@@ -107,6 +108,8 @@ def _flatten_yaml_config(raw: dict) -> dict[str, Any]:
         flat["plot_top_n"] = int(output["plot_top_n"])
     if output.get("unified_table") is not None:
         flat["unified_table"] = bool(output["unified_table"])
+    if output.get("visualize_matrices") is not None:
+        flat["visualize_matrices"] = bool(output["visualize_matrices"])
 
     return flat
 
@@ -213,6 +216,8 @@ def _serialize_run_config(config: dict[str, Any], path: Path) -> None:
         output["plot_top_n"] = flat.pop("plot_top_n")
     if "unified_table" in flat:
         output["unified_table"] = flat.pop("unified_table")
+    if "visualize_matrices" in flat:
+        output["visualize_matrices"] = flat.pop("visualize_matrices")
     if output:
         nested["output"] = output
 
@@ -405,6 +410,16 @@ def cli() -> None:
         "pepXML <error_point> elements after PeptideProphet runs."
     ),
 )
+@click.option(
+    "--visualize-matrices/--no-visualize-matrices",
+    "visualize_matrices",
+    default=None,
+    help=(
+        "Generate matrix visualization outputs (heatmaps, TSV exports, compressed "
+        "matrices) for peptide degeneracy analysis. Outputs go to "
+        "diagnostics/matrices/ under the run directory."
+    ),
+)
 def run_cmd(
     config_path: Path | None,
     input_path: Path | None,
@@ -422,6 +437,7 @@ def run_cmd(
     proteome_mass_correction: bool | None,
     min_psm_threshold: int | None,
     target_fdr: float | None,
+    visualize_matrices: bool | None,
 ) -> None:
     """Start a new run or resume latest if user confirms."""
 
@@ -440,6 +456,7 @@ def run_cmd(
         "proteome_mass_correction": proteome_mass_correction,
         "min_psm_threshold": min_psm_threshold,
         "target_fdr": target_fdr,
+        "visualize_matrices": visualize_matrices,
     }
 
     config = load_config(config_path, cli_overrides)
@@ -636,6 +653,16 @@ def start_server_cmd() -> None:
         "pepXML <error_point> elements after PeptideProphet runs."
     ),
 )
+@click.option(
+    "--visualize-matrices/--no-visualize-matrices",
+    "visualize_matrices",
+    default=None,
+    help=(
+        "Generate matrix visualization outputs (heatmaps, TSV exports, compressed "
+        "matrices) for peptide degeneracy analysis. Outputs go to "
+        "diagnostics/matrices/ under the run directory."
+    ),
+)
 def run_pipeline_cmd(
     config_path: Path | None,
     input_path: Path | None,
@@ -651,6 +678,7 @@ def run_pipeline_cmd(
     proteome_mass_correction: bool | None,
     min_psm_threshold: int | None,
     target_fdr: float | None,
+    visualize_matrices: bool | None,
 ) -> None:
     """Run the full pipeline non-interactively in no-LLM mode."""
 
@@ -669,6 +697,7 @@ def run_pipeline_cmd(
         "proteome_mass_correction": proteome_mass_correction,
         "min_psm_threshold": min_psm_threshold,
         "target_fdr": target_fdr,
+        "visualize_matrices": visualize_matrices,
     }
 
     config = load_config(config_path, cli_overrides)
