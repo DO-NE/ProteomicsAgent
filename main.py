@@ -37,6 +37,7 @@ _ENV_VAR_MAP: dict[str, str] = {
     "min_marker_families": "TAXON_MARKER_MIN_FAMILIES",
     "min_marker_psms": "TAXON_MARKER_MIN_PSMS",
     "proteome_mass_correction": "TAXON_PROTEOME_MASS_CORRECTION",
+    "genome_scaling_exponent": "TAXON_GENOME_SCALING_EXPONENT",
     "alpha": "TAXON_EM_ALPHA",
     "max_iter": "TAXON_EM_MAX_ITER",
     "tol": "TAXON_EM_TOL",
@@ -78,6 +79,8 @@ def _flatten_yaml_config(raw: dict) -> dict[str, Any]:
     pm = corrections.get("proteome_mass") or {}
     if "enabled" in pm and pm["enabled"] is not None:
         flat["proteome_mass_correction"] = bool(pm["enabled"])
+    if pm.get("genome_scaling_exponent") is not None:
+        flat["genome_scaling_exponent"] = float(pm["genome_scaling_exponent"])
     marker = corrections.get("marker") or {}
     if "enabled" in marker and marker["enabled"] is not None:
         flat["marker_correction"] = bool(marker["enabled"])
@@ -182,6 +185,8 @@ def _serialize_run_config(config: dict[str, Any], path: Path) -> None:
     pm: dict[str, Any] = {}
     if "proteome_mass_correction" in flat:
         pm["enabled"] = flat.pop("proteome_mass_correction")
+    if "genome_scaling_exponent" in flat:
+        pm["genome_scaling_exponent"] = flat.pop("genome_scaling_exponent")
     if pm:
         corr["proteome_mass"] = pm
     marker: dict[str, Any] = {}
@@ -394,6 +399,17 @@ def cli() -> None:
     help="Enable proteome-size-weighted protein-biomass abundance correction",
 )
 @click.option(
+    "--genome-scaling-exponent",
+    "genome_scaling_exponent",
+    type=float,
+    default=None,
+    help=(
+        "Exponent α in b_t = π_t / W_t^α. Default 4.8 (Kempes 2016 bacterial "
+        "genome-volume scaling). α=1 recovers the original linear form. α=0 "
+        "disables proteome-mass correction."
+    ),
+)
+@click.option(
     "--min-psm-threshold",
     type=int,
     default=None,
@@ -435,6 +451,7 @@ def run_cmd(
     marker_correction: bool | None,
     hmm_profile_dir: Path | None,
     proteome_mass_correction: bool | None,
+    genome_scaling_exponent: float | None,
     min_psm_threshold: int | None,
     target_fdr: float | None,
     visualize_matrices: bool | None,
@@ -454,6 +471,7 @@ def run_cmd(
         "marker_correction": marker_correction,
         "hmm_profile_dir": str(hmm_profile_dir) if hmm_profile_dir else None,
         "proteome_mass_correction": proteome_mass_correction,
+        "genome_scaling_exponent": genome_scaling_exponent,
         "min_psm_threshold": min_psm_threshold,
         "target_fdr": target_fdr,
         "visualize_matrices": visualize_matrices,
@@ -470,6 +488,12 @@ def run_cmd(
             style="red",
         ))
         raise SystemExit(1)
+
+    # Materialize the genome-scaling exponent in the saved config when the
+    # proteome-mass correction is on, so run_config.yaml records the actual
+    # α value used (not just an absent key resolved later by plugin default).
+    if config.get("proteome_mass_correction") and "genome_scaling_exponent" not in config:
+        config["genome_scaling_exponent"] = 4.8
 
     if config.get("output_dir"):
         os.environ["OUTPUT_DIR"] = str(config["output_dir"])
@@ -637,6 +661,17 @@ def start_server_cmd() -> None:
     help="Enable proteome-size-weighted protein-biomass abundance correction",
 )
 @click.option(
+    "--genome-scaling-exponent",
+    "genome_scaling_exponent",
+    type=float,
+    default=None,
+    help=(
+        "Exponent α in b_t = π_t / W_t^α. Default 4.8 (Kempes 2016 bacterial "
+        "genome-volume scaling). α=1 recovers the original linear form. α=0 "
+        "disables proteome-mass correction."
+    ),
+)
+@click.option(
     "--min-psm-threshold",
     type=int,
     default=None,
@@ -676,6 +711,7 @@ def run_pipeline_cmd(
     marker_correction: bool | None,
     hmm_profile_dir: Path | None,
     proteome_mass_correction: bool | None,
+    genome_scaling_exponent: float | None,
     min_psm_threshold: int | None,
     target_fdr: float | None,
     visualize_matrices: bool | None,
@@ -695,6 +731,7 @@ def run_pipeline_cmd(
         "marker_correction": marker_correction,
         "hmm_profile_dir": str(hmm_profile_dir) if hmm_profile_dir else None,
         "proteome_mass_correction": proteome_mass_correction,
+        "genome_scaling_exponent": genome_scaling_exponent,
         "min_psm_threshold": min_psm_threshold,
         "target_fdr": target_fdr,
         "visualize_matrices": visualize_matrices,
@@ -711,6 +748,12 @@ def run_pipeline_cmd(
             style="red",
         ))
         raise SystemExit(1)
+
+    # Materialize the genome-scaling exponent in the saved config when the
+    # proteome-mass correction is on, so run_config.yaml records the actual
+    # α value used (not just an absent key resolved later by plugin default).
+    if config.get("proteome_mass_correction") and "genome_scaling_exponent" not in config:
+        config["genome_scaling_exponent"] = 4.8
 
     if config.get("output_dir"):
         os.environ["OUTPUT_DIR"] = str(config["output_dir"])

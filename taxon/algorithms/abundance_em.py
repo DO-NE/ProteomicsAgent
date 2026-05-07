@@ -90,6 +90,12 @@ class AbundanceEMPlugin(TaxonPlugin):
         Directory where auxiliary output files (e.g.
         ``unclassified_entries.tsv``) are written.  When unset, no
         auxiliary files are produced.
+    genome_scaling_exponent : float
+        Exponent α in ``b_t = π_t / W_t^α`` (default ``4.8``, Kempes-2016
+        bacterial genome-volume scaling).  ``α=1`` reproduces the
+        original linear TPA form; ``α=0`` disables proteome-mass
+        correction.  Only consulted when ``proteome_mass_correction``
+        is true.
     """
 
     name = "abundance_em"
@@ -348,9 +354,17 @@ class AbundanceEMPlugin(TaxonPlugin):
         # --- Proteome-mass correction (Cycle 5b, opt-in) ---
         biomass_result = None
         if config.get("proteome_mass_correction", False):
+            # `genome_scaling_exponent` (α) controls the W_t^α denominator
+            # in b_t. Default 4.8 follows Kempes-2016 bacterial scaling;
+            # α=1 reproduces the original linear TPA form (Pible-2020 /
+            # Kleiner-2017); α=0 disables the correction entirely.
+            genome_scaling_exponent = float(
+                config.get("genome_scaling_exponent", 4.8)
+            )
             biomass_result = self._run_proteome_mass_correction(
                 model=model,
                 mapping_result=mapping_result,
+                alpha=genome_scaling_exponent,
             )
 
         # Convert to TaxonResult objects.
@@ -589,11 +603,22 @@ class AbundanceEMPlugin(TaxonPlugin):
     # ------------------------------------------------- proteome-mass correction
 
     @staticmethod
-    def _run_proteome_mass_correction(model, mapping_result):
+    def _run_proteome_mass_correction(model, mapping_result, alpha: float = 4.8):
         """Run proteome-size-weighted biomass correction.
 
+        Parameters
+        ----------
+        model : AbundanceEM
+            Fitted EM model providing ``pi_``.
+        mapping_result : MappingMatrixResult
+            Carries ``taxon_total_protein_counts`` and ``taxon_labels``.
+        alpha : float, default 4.8
+            Genome-scaling exponent applied to W_t (see
+            :func:`taxon.algorithms.abundance_em_core.proteome_mass_correction.compute_biomass_abundance`).
+
         Returns a :class:`ProteomeMassCorrectionResult`, or ``None`` on failure
-        (errors are logged at WARNING and never raised).
+        (errors are logged at WARNING and never raised — including ``ValueError``
+        from a negative ``alpha``).
         """
         from .abundance_em_core.proteome_mass_correction import (
             compute_proteome_sizes,
@@ -610,6 +635,7 @@ class AbundanceEMPlugin(TaxonPlugin):
                 pi=model.pi_,
                 proteome_sizes=proteome_sizes,
                 taxon_labels=mapping_result.taxon_labels,
+                alpha=alpha,
             )
             log_proteome_mass_diagnostics(biomass_result, logger=logger)
             return biomass_result

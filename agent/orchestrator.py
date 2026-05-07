@@ -297,6 +297,18 @@ class Orchestrator:
         elif proteome_mass_env is not None:
             config["proteome_mass_correction"] = proteome_mass_env.lower() not in ("0", "false", "no")
 
+        # Genome-scaling exponent α for the proteome-mass correction
+        # (b_t = π_t / W_t^α). Mirrors the pepxml_path / proteome_mass
+        # forwarding pattern (Cycle 4 fix): explicit param > env var >
+        # plugin default. Only consulted when proteome_mass_correction
+        # is enabled, but always plumbed through so run_config.yaml can
+        # record the value.
+        gse_env = os.getenv("TAXON_GENOME_SCALING_EXPONENT")
+        if "genome_scaling_exponent" in params and params["genome_scaling_exponent"] is not None:
+            config["genome_scaling_exponent"] = float(params["genome_scaling_exponent"])
+        elif gse_env is not None and gse_env != "":
+            config["genome_scaling_exponent"] = float(gse_env)
+
         # Marker-correction thresholds (optional, env-driven via main.py YAML config).
         for env_name, key, cast in (
             ("TAXON_MARKER_MIN_FAMILIES", "min_marker_families", int),

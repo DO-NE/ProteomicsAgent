@@ -99,12 +99,12 @@ class TestComputeProteomeSizes:
 
 class TestComputeBiomassAbundance:
     def test_basic_correction(self):
-        """b_t = normalize(pi / W_t) for 3 taxa with known values."""
+        """b_t = normalize(pi / W_t) for 3 taxa with known values (α=1)."""
         pi = np.array([0.5, 0.3, 0.2])
         W = np.array([100.0, 200.0, 50.0])
         labels = ["A|TaxA", "B|TaxB", "C|TaxC"]
 
-        result = compute_biomass_abundance(pi, W, labels)
+        result = compute_biomass_abundance(pi, W, labels, alpha=1.0)
 
         weighted = pi / W          # [0.005, 0.0015, 0.004]
         expected = weighted / weighted.sum()
@@ -137,7 +137,7 @@ class TestComputeBiomassAbundance:
         W = np.array([3000.0, 1000.0])
         labels = ["Multi|SalmonellaLT2", "Single|EcoliK12"]
 
-        result = compute_biomass_abundance(pi, W, labels)
+        result = compute_biomass_abundance(pi, W, labels, alpha=1.0)
 
         np.testing.assert_allclose(result.biomass_abundance[0], 0.25, atol=1e-10)
         np.testing.assert_allclose(result.biomass_abundance[1], 0.75, atol=1e-10)
@@ -148,12 +148,13 @@ class TestComputeBiomassAbundance:
         W = np.array([100.0, 200.0])
         labels = ["A|TaxA", "B|TaxB"]
 
-        result = compute_biomass_abundance(pi, W, labels)
+        result = compute_biomass_abundance(pi, W, labels, alpha=1.0)
 
         assert result.n_taxa == 2
         assert result.min_proteome_size == 100
         assert result.max_proteome_size == 200
         assert result.median_proteome_size == 150.0
+        assert result.alpha == 1.0
         np.testing.assert_array_equal(result.psm_abundance, pi)
         np.testing.assert_array_equal(result.proteome_sizes, W)
         np.testing.assert_array_equal(result.taxon_labels, labels)
@@ -206,6 +207,117 @@ class TestLogProteomeMassDiagnostics:
         assert "Cupriavidus metallidurans" in report
 
 
+class TestGenomeScalingExponent:
+    """Tests for the configurable α exponent in b_t = π_t / W_t^α."""
+
+    def test_alpha_one_reproduces_original(self):
+        """α=1 must be bit-identical to the legacy ``π_t / W_t`` form.
+
+        The new implementation short-circuits ``alpha == 1.0`` to keep the
+        original division so a pre-existing reference value (computed
+        without ``np.power``) round-trips exactly.
+        """
+        pi = np.array([0.5, 0.3, 0.2])
+        W = np.array([100.0, 200.0, 50.0])
+        labels = ["A|TaxA", "B|TaxB", "C|TaxC"]
+
+        # Hand-computed reference using the pre-α formula.
+        weighted_ref = pi / W
+        expected = weighted_ref / weighted_ref.sum()
+
+        result = compute_biomass_abundance(pi, W, labels, alpha=1.0)
+
+        # Equality, not allclose — the legacy code path must produce
+        # *bit-identical* output.
+        np.testing.assert_array_equal(result.biomass_abundance, expected)
+        assert result.alpha == 1.0
+
+    def test_alpha_zero_returns_pi(self):
+        """α=0 → W_t^0 = 1 for every taxon, so b_t == π_t after renorm."""
+        pi = np.array([0.6, 0.25, 0.15])
+        W = np.array([10.0, 5000.0, 100.0])
+        labels = ["A|TaxA", "B|TaxB", "C|TaxC"]
+
+        result = compute_biomass_abundance(pi, W, labels, alpha=0.0)
+
+        np.testing.assert_allclose(result.biomass_abundance, pi, atol=1e-12)
+        assert result.alpha == 0.0
+
+    def test_alpha_4p8_ratio(self):
+        """W=[1000, 5000], π=[0.5, 0.5] → smaller-W taxon ~5^4.8 ≈ 2265× larger.
+
+        (The task description rounded this to "≈ 2330×"; the exact value of
+        5^4.8 is 2264.937, which the strict ``assert_allclose`` below
+        validates to 1e-9 relative tolerance.)
+        """
+        pi = np.array([0.5, 0.5])
+        W = np.array([1000.0, 5000.0])
+        labels = ["A|small_genome", "B|big_genome"]
+
+        result = compute_biomass_abundance(pi, W, labels, alpha=4.8)
+
+        # Ratio of unnormalized weights: (π_A / W_A^α) / (π_B / W_B^α)
+        # = (W_B / W_A)^α = 5^4.8.
+        expected_ratio = 5.0 ** 4.8
+        ratio = result.biomass_abundance[0] / result.biomass_abundance[1]
+        np.testing.assert_allclose(ratio, expected_ratio, rtol=1e-9)
+        # Order-of-magnitude sanity bound on 5^4.8 ≈ 2265 (large genome
+        # gets ~2000–3000× downweighted under bacterial scaling).
+        assert 2000 < ratio < 3000
+
+    def test_alpha_negative_raises(self):
+        """α < 0 must raise ValueError."""
+        pi = np.array([0.5, 0.5])
+        W = np.array([100.0, 200.0])
+        labels = ["A|TaxA", "B|TaxB"]
+
+        with pytest.raises(ValueError):
+            compute_biomass_abundance(pi, W, labels, alpha=-0.1)
+
+    def test_large_W_no_overflow(self):
+        """W=1e5, α=4.8 should produce finite output thanks to log-space exp."""
+        pi = np.array([0.5, 0.5])
+        W = np.array([1.0e5, 1.0])
+        labels = ["A|huge", "B|tiny"]
+
+        result = compute_biomass_abundance(pi, W, labels, alpha=4.8)
+
+        assert np.all(np.isfinite(result.biomass_abundance))
+        assert np.all(np.isfinite(result.weighted_signal))
+        np.testing.assert_allclose(result.biomass_abundance.sum(), 1.0, atol=1e-10)
+        # The huge-W taxon should be vanishingly small after correction.
+        assert result.biomass_abundance[0] < 1e-20
+
+    def test_zero_W_handling(self):
+        """W_t = 0 case must behave exactly as before the α refactor.
+
+        The legacy code falls back to ``W_t = 1`` locally for the
+        division but reports the original 0 in ``proteome_sizes``.
+        With α=1 this should still produce the same biomass vector
+        as the pre-α implementation.
+        """
+        pi = np.array([0.4, 0.6])
+        W = np.array([0.0, 100.0])
+        labels = ["A|empty", "B|normal"]
+
+        # Legacy reference: sizes_safe = [1, 100], weighted = π / sizes_safe
+        weighted_ref = pi / np.array([1.0, 100.0])
+        expected = weighted_ref / weighted_ref.sum()
+
+        result = compute_biomass_abundance(pi, W, labels, alpha=1.0)
+
+        np.testing.assert_array_equal(result.biomass_abundance, expected)
+        # proteome_sizes must still report the original 0 (not the local fallback).
+        assert int(result.proteome_sizes[0]) == 0
+        assert int(result.proteome_sizes[1]) == 100
+        # And the same with α=4.8: W=0 → 1 fallback applied before exponentiation.
+        result48 = compute_biomass_abundance(pi, W, labels, alpha=4.8)
+        # With sizes_safe = [1, 100], W^4.8 = [1, 100^4.8].
+        ref_w = pi * np.exp(-4.8 * np.log(np.array([1.0, 100.0])))
+        ref_b = ref_w / ref_w.sum()
+        np.testing.assert_allclose(result48.biomass_abundance, ref_b, atol=1e-12)
+
+
 class TestIntegrationWithTaxonProteinPeptides:
     def test_protein_count_not_peptide_count(self):
         """W_t counts total FASTA protein entries, not observed peptides."""
@@ -218,7 +330,7 @@ class TestIntegrationWithTaxonProteinPeptides:
         assert int(sizes[1]) == 10
 
     def test_full_pipeline_compute_sizes_then_biomass(self):
-        """End-to-end: build total_counts, compute sizes, compute biomass."""
+        """End-to-end: build total_counts, compute sizes, compute biomass (α=1)."""
         total_counts, labels = _make_taxon_protein_peptides({
             "LT2|Salmonella typhimurium": 500,
             "Cup|Cupriavidus metallidurans": 250,
@@ -226,7 +338,7 @@ class TestIntegrationWithTaxonProteinPeptides:
         pi = np.array([0.5, 0.5])
 
         sizes = compute_proteome_sizes(total_counts, labels)
-        result = compute_biomass_abundance(pi, sizes, labels)
+        result = compute_biomass_abundance(pi, sizes, labels, alpha=1.0)
 
         # W = [500, 250], pi = [0.5, 0.5]
         # weighted = [0.5/500, 0.5/250] = [0.001, 0.002], normalized = [1/3, 2/3]
