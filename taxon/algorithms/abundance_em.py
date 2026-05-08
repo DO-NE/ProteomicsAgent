@@ -529,6 +529,15 @@ class AbundanceEMPlugin(TaxonPlugin):
             mapping_result.taxon_labels
         )
 
+        # Per-marker-peptide TSV path lives next to marker_diagnostics.txt.
+        # When no output_dir is configured the dump is suppressed (the flag
+        # alone is not enough — a target path is also required).
+        output_dir_cfg = config.get("output_dir")
+        marker_peptide_table_path = (
+            str(Path(str(output_dir_cfg)) / "diagnostics" / "marker_peptides.tsv")
+            if output_dir_cfg else None
+        )
+
         result = compute_cell_equivalent_abundance(
             pi=model.pi_,
             responsibilities=model.responsibilities_,
@@ -541,6 +550,7 @@ class AbundanceEMPlugin(TaxonPlugin):
             min_marker_families=int(config.get("min_marker_families", 3)),
             min_marker_psms=float(config.get("min_marker_psms", 1.0)),
             taxon_kingdom=taxon_kingdom,
+            marker_peptide_table_path=marker_peptide_table_path,
         )
 
         log_marker_diagnostics(result, logger_obj=logger)

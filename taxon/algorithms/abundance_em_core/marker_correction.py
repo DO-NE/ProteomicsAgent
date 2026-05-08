@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -72,6 +73,8 @@ def compute_cell_equivalent_abundance(
     min_marker_psms: float = 1.0,
     taxon_kingdom: Optional[dict] = None,
     exclude_kingdoms: frozenset = frozenset({"Eukaryota"}),
+    emit_marker_peptide_table: bool = True,
+    marker_peptide_table_path: Optional[str] = None,
 ) -> MarkerCorrectionResult:
     """Convert PSM-level ``pi`` to a cell-equivalent relative abundance.
 
@@ -120,6 +123,17 @@ def compute_cell_equivalent_abundance(
         marker-based estimate.
     min_marker_psms : float, default ``1.0``
         Minimum total fractional marker PSM count for a taxon.
+    emit_marker_peptide_table : bool, default ``True``
+        When *True* and *marker_peptide_table_path* is set, dump a
+        per-(taxon, marker_family, marker_protein_accession,
+        peptide_sequence) diagnostic TSV to the given path.  Pure
+        diagnostic — does not affect any returned value.  A failure to
+        write the file is logged at WARNING and never raises.
+    marker_peptide_table_path : str or path-like, optional
+        Output path for the per-marker-peptide TSV.  When *None* (the
+        default), no file is written even if *emit_marker_peptide_table*
+        is *True* — this keeps the function suitable for unit tests and
+        in-memory callers that have no output directory.
 
     Returns
     -------
@@ -313,6 +327,32 @@ def compute_cell_equivalent_abundance(
         total_marker_psms / total_y if total_y > 0 else 0.0
     )
 
+    # ------------------------------------------------------------------ diagnostic dump
+    # Per-(taxon, family, protein, peptide) TSV.  Pure diagnostic — runs
+    # in a separate pass after the algorithmic accumulators are finalised
+    # and is wrapped in try/except so a write error can never affect the
+    # values returned to the caller.
+    if emit_marker_peptide_table and marker_peptide_table_path is not None:
+        try:
+            n_rows = _emit_marker_peptide_table(
+                output_path=Path(str(marker_peptide_table_path)),
+                marker_proteins=marker_proteins,
+                taxon_protein_peptides=taxon_protein_peptides,
+                taxon_labels=list(taxon_labels),
+                label_to_idx=label_to_idx,
+                excluded_taxa=excluded_taxa,
+                spectral_counts=spectral_counts,
+                responsibilities=responsibilities,
+                mapping_matrix=mapping_matrix,
+                peptide_index=peptide_index,
+                marker_psm_count=marker_psm_count,
+            )
+            logger.debug(
+                "marker_peptides.tsv emitted with %d rows", n_rows,
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostic must never break the pipeline
+            logger.warning("Failed to write marker_peptides.tsv: %s", exc)
+
     return MarkerCorrectionResult(
         cell_abundance=cell_abundance,
         psm_abundance=pi.copy(),
@@ -327,6 +367,228 @@ def compute_cell_equivalent_abundance(
         fraction_psms_from_markers=fraction_psms_from_markers,
         family_signal_per_taxon=dict(family_signal_per_taxon),
     )
+
+
+def _emit_marker_peptide_table(
+    output_path: Path,
+    marker_proteins: dict,
+    taxon_protein_peptides: dict,
+    taxon_labels: list,
+    label_to_idx: dict,
+    excluded_taxa: set,
+    spectral_counts: dict,
+    responsibilities: np.ndarray,
+    mapping_matrix: np.ndarray,
+    peptide_index: dict,
+    marker_psm_count: np.ndarray,
+) -> int:
+    """Dump per-(taxon, family, protein, peptide) marker diagnostic TSV.
+
+    Side-effecting helper called from :func:`compute_cell_equivalent_abundance`
+    after its main accumulation completes.  Performs **no** mutation of any
+    argument and produces no algorithmic side effects — calling it has the
+    same effect on EM-derived outputs as not calling it.
+
+    Parameters
+    ----------
+    output_path : Path
+        Destination TSV.  Parent directory is created if missing.
+    marker_proteins, taxon_protein_peptides, taxon_labels, label_to_idx,
+    excluded_taxa, spectral_counts, responsibilities, mapping_matrix,
+    peptide_index :
+        Same objects already in scope inside
+        :func:`compute_cell_equivalent_abundance`.  See that function's
+        parameter documentation for descriptions.
+    marker_psm_count : np.ndarray, shape ``(T,)``
+        Per-taxon ``Σ_p y_p · r_{pt}`` over marker peptides as computed
+        by the main loop — used solely for the post-write sanity check.
+
+    Returns
+    -------
+    int
+        Number of data rows written (excluding header).
+
+    Notes
+    -----
+    Granularity is one row per (consumer_taxon, marker_family,
+    marker_protein, peptide).  The *consumer* taxon is any taxon that
+    receives EM responsibility for the marker peptide *or* owns the
+    marker protein in its FASTA digest — the union ensures both
+    consistency with ``marker_psm_count`` (which sums ``y_p · r_pt`` over
+    every consumer taxon, not just the owners) and that "potentially
+    observable but unobserved" marker peptides still appear at least
+    once with their owner taxon.
+
+    The ``marker_protein_accession`` and ``marker_protein_hmm_evalue``
+    columns refer to the FASTA hit identified by hmmsearch — i.e., the
+    *origin* of the marker assignment.  For consumer taxa that do not
+    own the marker protein (shared marker peptide allocated by the EM)
+    the accession still points at the original marker-hit protein, since
+    that is what classified the peptide as a marker in the first place.
+
+    A peptide that appears in multiple (family, protein) origins for the
+    same consumer taxon yields one row per origin, all carrying the same
+    ``r_pt`` and ``weighted_psm_contribution``.  The sanity check at the
+    end deduplicates by (consumer_taxon, peptide) before summing so a
+    naive sum-over-rows can over-count and is documented accordingly.
+    """
+    A = np.asarray(mapping_matrix)
+    if A.ndim == 2 and A.size > 0:
+        row_sums = A.sum(axis=1).astype(np.int64)
+    else:
+        row_sums = np.zeros(0, dtype=np.int64)
+
+    R = np.asarray(responsibilities, dtype=np.float64)
+    T = len(taxon_labels)
+
+    # ------------------------------------------------------------------ step 1
+    # Build peptide -> list of (accession, family, evalue, owner_taxon_label).
+    # Mirrors the iteration in compute_cell_equivalent_abundance step 1, but
+    # preserves the (accession, family, owner) provenance per peptide.
+    peptide_origins: dict = defaultdict(list)
+    for accession, payload in marker_proteins.items():
+        try:
+            _hmm_taxon_label, families_raw, evalue, _score = payload
+        except (TypeError, ValueError):
+            continue
+        families_list = (
+            families_raw if isinstance(families_raw, list) else [families_raw]
+        )
+        try:
+            evalue_f = float(evalue)
+        except (TypeError, ValueError):
+            evalue_f = float("nan")
+
+        for taxon_label, prot_map in taxon_protein_peptides.items():
+            if label_to_idx.get(taxon_label) in excluded_taxa:
+                continue
+            peps = prot_map.get(accession)
+            if not peps:
+                continue
+            for pep in peps:
+                pep_upper = pep.upper()
+                for fam in families_list:
+                    peptide_origins[pep_upper].append(
+                        (accession, str(fam), evalue_f, taxon_label)
+                    )
+
+    # ------------------------------------------------------------------ step 2
+    # Expand each marker peptide to the union of consumer taxa: any taxon
+    # with non-zero responsibility, plus the owner taxa from the origins.
+    # The owner-set ensures unobserved marker peptides (y_p == 0, r_row = 0)
+    # still appear at least once.
+    rows: list = []
+    # (consumer_t_idx, pep_upper) -> y_p * r_pt, for the sanity check.
+    dedup_contrib: dict = {}
+
+    for pep_upper, origins in peptide_origins.items():
+        p_idx = peptide_index.get(pep_upper)
+        if (
+            p_idx is not None
+            and 0 <= p_idx < R.shape[0]
+        ):
+            r_row = R[p_idx]
+        else:
+            r_row = np.zeros(T, dtype=np.float64)
+        if (
+            p_idx is not None
+            and 0 <= p_idx < row_sums.shape[0]
+        ):
+            n_sharing = int(row_sums[p_idx])
+        else:
+            n_sharing = 0
+        is_unique = (n_sharing == 1)
+        y_p = int(spectral_counts.get(pep_upper, 0))
+
+        owner_idxs = {
+            label_to_idx[lbl]
+            for _a, _f, _e, lbl in origins
+            if lbl in label_to_idx and label_to_idx[lbl] not in excluded_taxa
+        }
+        nonzero_idxs = {
+            int(i) for i in np.nonzero(r_row > 0)[0]
+            if int(i) not in excluded_taxa and int(i) < T
+        }
+        consumer_idxs = owner_idxs | nonzero_idxs
+        if not consumer_idxs:
+            continue
+
+        for t_idx in consumer_idxs:
+            r_pt = float(r_row[t_idx]) if t_idx < r_row.shape[0] else 0.0
+            weighted = float(y_p) * r_pt
+            dedup_contrib[(t_idx, pep_upper)] = weighted
+            tlbl = taxon_labels[t_idx]
+            tid, tname = (
+                tlbl.split("|", 1) if "|" in tlbl else ("0", tlbl)
+            )
+            for accession, fam, evalue_f, _owner in origins:
+                rows.append((
+                    tid, tname, fam, accession, evalue_f,
+                    pep_upper, len(pep_upper), is_unique, n_sharing,
+                    y_p, r_pt, weighted,
+                ))
+
+    # Deterministic order: taxon_id, marker_family, accession, peptide.
+    rows.sort(key=lambda r: (r[0], r[2], r[3], r[5]))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as fh:
+        fh.write(
+            "taxon_id\ttaxon_name\tmarker_family\tmarker_protein_accession\t"
+            "marker_protein_hmm_evalue\tpeptide_sequence\tpeptide_length\t"
+            "is_unique_peptide\tn_taxa_sharing\ty_p\tr_pt\t"
+            "weighted_psm_contribution\n"
+        )
+        for r in rows:
+            tid, tname, fam, acc, ev, pep, plen, uniq, ns, yp, rpt, w = r
+            ev_str = f"{ev:.6e}" if not np.isnan(ev) else "nan"
+            fh.write(
+                f"{tid}\t{tname}\t{fam}\t{acc}\t"
+                f"{ev_str}\t{pep}\t{plen}\t"
+                f"{bool(uniq)}\t{ns}\t{yp}\t{rpt:.6f}\t{w:.6f}\n"
+            )
+
+    # Sanity check: per-taxon dedup-summed weighted_psm_contribution must
+    # match marker_psm_count within 1e-6.  Disagreement here indicates a
+    # regression in this dump function (not in the algorithm).
+    psm_per_taxon = np.zeros(T, dtype=np.float64)
+    for (t_idx, _pep), contrib in dedup_contrib.items():
+        psm_per_taxon[t_idx] += contrib
+
+    target = np.asarray(marker_psm_count, dtype=np.float64)
+    if target.shape[0] != T:
+        # Defensive — should never happen, but avoids an obscure traceback
+        # if a future caller passes a misshapen vector.
+        logger.warning(
+            "marker_peptides.tsv consistency check skipped: "
+            "marker_psm_count shape %s does not match T=%d",
+            target.shape, T,
+        )
+        return len(rows)
+
+    deltas = np.abs(psm_per_taxon - target)
+    max_delta = float(deltas.max()) if deltas.size else 0.0
+    if max_delta < 1e-6:
+        logger.info(
+            "marker_peptides.tsv contains %d rows; sum of "
+            "weighted_psm_contribution per taxon matches "
+            "abundance_results.tsv marker_psms within 1e-6 "
+            "(max delta %.3e)",
+            len(rows), max_delta,
+        )
+    else:
+        worst_t = int(deltas.argmax())
+        logger.warning(
+            "marker_peptides.tsv consistency check FAILED: max per-taxon "
+            "delta %.6e at taxon %s (dump=%.6f vs marker_psm_count=%.6f). "
+            "Total rows: %d. This indicates a regression in the dump "
+            "logic, not in the marker correction algorithm.",
+            max_delta, taxon_labels[worst_t],
+            float(psm_per_taxon[worst_t]), float(target[worst_t]),
+            len(rows),
+        )
+
+    return len(rows)
 
 
 def log_marker_diagnostics(

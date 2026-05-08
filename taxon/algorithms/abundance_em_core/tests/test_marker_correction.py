@@ -399,6 +399,212 @@ class TestMappingMatrixResult:
             assert isinstance(unclassified, list)
 
 
+class TestMarkerPeptideTable:
+    """Per-marker-peptide diagnostic TSV (Cycle 6).
+
+    These tests cover the new ``diagnostics/marker_peptides.tsv`` dump
+    emitted by :func:`compute_cell_equivalent_abundance` when given a
+    ``marker_peptide_table_path``.
+    """
+
+    _EXPECTED_HEADER = (
+        "taxon_id\ttaxon_name\tmarker_family\tmarker_protein_accession\t"
+        "marker_protein_hmm_evalue\tpeptide_sequence\tpeptide_length\t"
+        "is_unique_peptide\tn_taxa_sharing\ty_p\tr_pt\t"
+        "weighted_psm_contribution"
+    )
+
+    def _build_two_taxon_setup(self):
+        """2 taxa × 5 marker proteins × 2 peptides each = 20 marker peptides."""
+        taxa = ["1|A", "2|B"]
+        families = ["F1", "F2", "F3", "F4", "F5"]
+
+        marker_proteins: dict = {}
+        tpp: dict = {tlbl: {} for tlbl in taxa}
+        pep_to_taxa: dict = {}
+        sc: dict = {}
+        for tlbl in taxa:
+            short = tlbl.split("|")[1]
+            for fam in families:
+                acc = f"acc_{short}_{fam}"
+                marker_proteins[acc] = (tlbl, [fam], 1e-30, 200.0)
+                p1 = f"PEP_{short}_{fam}_A"
+                p2 = f"PEP_{short}_{fam}_B"
+                tpp[tlbl][acc] = [p1, p2]
+                pep_to_taxa[p1] = {tlbl}
+                pep_to_taxa[p2] = {tlbl}
+                sc[p1] = 6.0
+                sc[p2] = 4.0
+
+        pi = np.array([0.5, 0.5])
+        R, A, peptide_index, _peps, sc_dict = _make_synthetic_inputs(
+            pi, sc, pep_to_taxa, taxa,
+        )
+        return {
+            "pi": pi, "responsibilities": R, "A": A,
+            "peptide_index": peptide_index, "spectral_counts": sc_dict,
+            "taxa": taxa, "marker_proteins": marker_proteins,
+            "taxon_protein_peptides": tpp,
+        }
+
+    def test_marker_peptide_tsv_emitted(self):
+        """File is created with the expected header and row count."""
+        setup = self._build_two_taxon_setup()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tsv_path = Path(tmpdir) / "diagnostics" / "marker_peptides.tsv"
+            result = compute_cell_equivalent_abundance(
+                pi=setup["pi"],
+                responsibilities=setup["responsibilities"],
+                spectral_counts=setup["spectral_counts"],
+                mapping_matrix=setup["A"],
+                taxon_labels=setup["taxa"],
+                peptide_index=setup["peptide_index"],
+                marker_proteins=setup["marker_proteins"],
+                taxon_protein_peptides=setup["taxon_protein_peptides"],
+                min_marker_families=3,
+                min_marker_psms=1.0,
+                marker_peptide_table_path=str(tsv_path),
+            )
+
+            assert tsv_path.is_file(), f"TSV not created at {tsv_path}"
+
+            lines = tsv_path.read_text(encoding="utf-8").splitlines()
+            assert lines, "TSV is empty"
+            assert lines[0] == self._EXPECTED_HEADER, (
+                f"Header mismatch:\n  got: {lines[0]}\n  exp: {self._EXPECTED_HEADER}"
+            )
+            # 2 taxa × 5 families × 2 peptides = 20 rows; one row per
+            # (taxon, family, protein, peptide).
+            assert len(lines) - 1 == 20, (
+                f"Expected 20 data rows, got {len(lines) - 1}"
+            )
+
+            # Both taxa qualify under default thresholds.
+            assert result.has_marker_estimate.all()
+
+    def test_marker_peptide_tsv_consistency(self):
+        """Per-taxon dedup-summed contribution == marker_psm_count."""
+        setup = self._build_two_taxon_setup()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tsv_path = Path(tmpdir) / "marker_peptides.tsv"
+            result = compute_cell_equivalent_abundance(
+                pi=setup["pi"],
+                responsibilities=setup["responsibilities"],
+                spectral_counts=setup["spectral_counts"],
+                mapping_matrix=setup["A"],
+                taxon_labels=setup["taxa"],
+                peptide_index=setup["peptide_index"],
+                marker_proteins=setup["marker_proteins"],
+                taxon_protein_peptides=setup["taxon_protein_peptides"],
+                marker_peptide_table_path=str(tsv_path),
+            )
+
+            # Read TSV, dedup by (taxon_id, peptide), sum per taxon.
+            per_taxon_psms: dict = {}
+            seen_pairs: set = set()
+            with tsv_path.open("r", encoding="utf-8") as fh:
+                header = fh.readline().rstrip("\n").split("\t")
+                col = {name: i for i, name in enumerate(header)}
+                for raw in fh:
+                    fields = raw.rstrip("\n").split("\t")
+                    tid = fields[col["taxon_id"]]
+                    pep = fields[col["peptide_sequence"]]
+                    contrib = float(fields[col["weighted_psm_contribution"]])
+                    if (tid, pep) in seen_pairs:
+                        continue
+                    seen_pairs.add((tid, pep))
+                    per_taxon_psms[tid] = per_taxon_psms.get(tid, 0.0) + contrib
+
+            # Compare per-taxon sums to result.marker_psm_count.
+            label_to_idx = {lbl: i for i, lbl in enumerate(setup["taxa"])}
+            for tlbl, t_idx in label_to_idx.items():
+                tid = tlbl.split("|", 1)[0]
+                expected = float(result.marker_psm_count[t_idx])
+                got = per_taxon_psms.get(tid, 0.0)
+                assert abs(got - expected) < 1e-6, (
+                    f"Taxon {tlbl}: TSV sum {got} vs marker_psm_count "
+                    f"{expected} (delta {got - expected:.3e})"
+                )
+
+    def test_unique_flag_correctness(self):
+        """is_unique_peptide reflects A.sum(axis=1) == 1, not degeneracy."""
+        # P1 maps only to T1; P2 maps to T1 AND T2.  Both are markers in T1.
+        taxa = ["1|A", "2|B"]
+        marker_proteins = {
+            # T1 owns the protein that contains both P1 and P2.
+            "acc_A_F1": ("1|A", ["F1"], 1e-30, 100.0),
+            "acc_A_F2": ("1|A", ["F2"], 1e-30, 100.0),
+            "acc_A_F3": ("1|A", ["F3"], 1e-30, 100.0),
+        }
+        tpp = {
+            "1|A": {
+                "acc_A_F1": ["P1"],            # unique to T1
+                "acc_A_F2": ["P2"],            # shared with T2
+                "acc_A_F3": ["P3UNIQUE"],     # unique to T1, separate fam
+            },
+            "2|B": {},
+        }
+        # Critical: P2 must appear in T2's tryptic digest so A[P2,:] = [1,1].
+        pep_to_taxa = {
+            "P1": {"1|A"},
+            "P2": {"1|A", "2|B"},
+            "P3UNIQUE": {"1|A"},
+            # Give T2 a couple of non-marker peptides so its column is non-empty.
+            "B_OTHER1": {"2|B"},
+            "B_OTHER2": {"2|B"},
+        }
+        sc = {"P1": 8.0, "P2": 8.0, "P3UNIQUE": 8.0,
+              "B_OTHER1": 5.0, "B_OTHER2": 5.0}
+        pi = np.array([0.6, 0.4])
+
+        R, A, peptide_index, _peps, sc_dict = _make_synthetic_inputs(
+            pi, sc, pep_to_taxa, taxa,
+        )
+
+        # Sanity-check the synthetic A before running correction.
+        assert A[peptide_index["P1"]].sum() == 1
+        assert A[peptide_index["P2"]].sum() == 2
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tsv_path = Path(tmpdir) / "marker_peptides.tsv"
+            compute_cell_equivalent_abundance(
+                pi=pi,
+                responsibilities=R,
+                spectral_counts=sc_dict,
+                mapping_matrix=A,
+                taxon_labels=taxa,
+                peptide_index=peptide_index,
+                marker_proteins=marker_proteins,
+                taxon_protein_peptides=tpp,
+                min_marker_families=3,
+                min_marker_psms=1.0,
+                marker_peptide_table_path=str(tsv_path),
+            )
+
+            # Parse the TSV and check is_unique_peptide / n_taxa_sharing.
+            uniq_by_pep: dict = {}
+            sharing_by_pep: dict = {}
+            with tsv_path.open("r", encoding="utf-8") as fh:
+                header = fh.readline().rstrip("\n").split("\t")
+                col = {name: i for i, name in enumerate(header)}
+                for raw in fh:
+                    fields = raw.rstrip("\n").split("\t")
+                    pep = fields[col["peptide_sequence"]]
+                    uniq = fields[col["is_unique_peptide"]] == "True"
+                    ns = int(fields[col["n_taxa_sharing"]])
+                    uniq_by_pep[pep] = uniq
+                    sharing_by_pep[pep] = ns
+
+            assert uniq_by_pep["P1"] is True, "P1 should be unique"
+            assert sharing_by_pep["P1"] == 1
+            assert uniq_by_pep["P2"] is False, "P2 should not be unique"
+            assert sharing_by_pep["P2"] == 2
+            assert uniq_by_pep["P3UNIQUE"] is True
+            assert sharing_by_pep["P3UNIQUE"] == 1
+
+
 class TestDiagnosticReport:
     """log_marker_diagnostics smoke test — must produce a non-empty string."""
 
