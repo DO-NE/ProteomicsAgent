@@ -3,8 +3,9 @@
 The model treats observed peptide spectral counts as draws from a mixture of
 taxon-specific peptide emission distributions, where each taxon emits its
 member peptides with equal probability (uniform-emission baseline). Inference
-is performed by Expectation-Maximization on the log-posterior with a sparse
-Dirichlet prior.
+is performed by Expectation-Maximization on the log-posterior with a Dirichlet
+prior — symmetric by default, or an asymmetric empirical-Bayes prior anchored
+on the PSM-weighted unique-peptide vector.
 
 Generative model
 ----------------
@@ -15,7 +16,11 @@ Generative model
 - pi in simplex^{T-1} : taxon abundance vector (the inference target).
 - phi_p(pi) = sum_t pi_t * M_{pt} : marginal probability of peptide p.
 - y ~ Multinomial(N, phi(pi)).
-- pi ~ Dirichlet(alpha) prior, alpha < 1 encourages sparsity.
+- pi ~ Dirichlet(a) prior, where a is either:
+    * symmetric:        a_t = alpha for every t (sparsity-inducing if < 1).
+    * empirical_bayes:  a_t = prior_kappa * pi_hat_unique[t] + prior_alpha0,
+                        with pi_hat_unique built from the PSM-weighted unique
+                        peptides (see ``_compute_unique_psm_vector``).
 
 EM updates
 ----------
@@ -23,11 +28,14 @@ E-step:
     r_{pt} = (pi_t * M_{pt}) / phi_p
     c_{pt} = y_p * r_{pt}
 
-M-step (MAP with Dirichlet(alpha)):
-    pi_t^new = (sum_p c_{pt} + alpha - 1) / (N + T * (alpha - 1))
+M-step (MAP with Dirichlet(a)):
+    pi_t^new = (sum_p c_{pt} + a_t - 1) / (N + sum_t (a_t - 1))
 
-Components that go non-positive (possible when alpha < 1) are clamped to a
-small floor and the vector is renormalized.
+In the symmetric mode ``a_t = alpha`` and the denominator reduces to
+``N + T * (alpha - 1)``; in the empirical-Bayes mode it reduces to
+``N + prior_kappa + T * (prior_alpha0 - 1)``. Components that go non-positive
+(possible when any a_t < 1) are clamped to a small floor and the vector is
+renormalized.
 """
 
 from __future__ import annotations
@@ -76,13 +84,35 @@ class AbundanceEM:
     min_abundance : float, optional
         Post-convergence threshold. Taxa with ``pi < min_abundance`` are zeroed
         and the vector is renormalized (default ``1e-4``).
-    init : {"unique", "uniform", "random"}, optional
+    init : {"unique", "unique_psm", "uniform", "random"}, optional
         Initialization strategy for the first run (default ``"unique"``).
-        ``"unique"`` weights each taxon by the count of unique peptides that
-        also have nonzero spectral counts; ``"uniform"`` uses 1/T; ``"random"``
+        ``"unique"`` weights each taxon by the **count** of unique peptides
+        with nonzero spectral counts; ``"unique_psm"`` weights each taxon by
+        the **sum of spectral counts** over its unique peptides (so a taxon
+        with two heavily-observed unique peptides outranks one with five
+        barely-observed unique peptides); ``"uniform"`` uses 1/T; ``"random"``
         samples from Dirichlet(1, ..., 1). Restarts always use random.
     seed : int or None, optional
         Random seed for reproducibility.
+    prior_mode : {"symmetric", "empirical_bayes"}, optional
+        Form of the Dirichlet prior (default ``"symmetric"``).
+        ``"symmetric"`` uses ``Dir(alpha, ..., alpha)`` — identical to the
+        legacy behavior. ``"empirical_bayes"`` uses an asymmetric
+        ``Dir(a_1, ..., a_T)`` with
+        ``a_t = prior_kappa * pi_hat_unique[t] + prior_alpha0``, where
+        ``pi_hat_unique`` is the PSM-weighted unique-peptide vector
+        (see ``_compute_unique_psm_vector``). ``alpha`` is ignored in this
+        mode; ``prior_alpha0`` provides the symmetric baseline and
+        ``prior_kappa`` controls how strongly the prior is pulled toward the
+        unique-peptide signal.
+    prior_kappa : float, optional
+        Concentration of the empirical-Bayes prior. Larger values pull the
+        M-step output more strongly toward ``pi_hat_unique``. Defaults to
+        ``0.0`` (no pull; with ``prior_alpha0 == alpha`` the EB mode collapses
+        to the symmetric mode). Ignored when ``prior_mode='symmetric'``.
+    prior_alpha0 : float, optional
+        Symmetric baseline of the empirical-Bayes prior (default ``0.5``).
+        Only consulted when ``prior_mode='empirical_bayes'``.
     detectability_mode : {"uniform", "sequence_features", "file"}, optional
         How to compute per-peptide detectability weights (default
         ``"uniform"``).  ``"uniform"`` reproduces the original unweighted
@@ -139,6 +169,9 @@ class AbundanceEM:
         detectability_mode: str = "uniform",
         detectability_file: Optional[str] = None,
         detectability_weights: Optional[np.ndarray] = None,
+        prior_mode: str = "symmetric",
+        prior_kappa: float = 0.0,
+        prior_alpha0: float = 0.5,
     ) -> None:
         if alpha <= 0:
             raise ValueError("alpha must be > 0")
@@ -148,8 +181,10 @@ class AbundanceEM:
             raise ValueError("tol must be > 0")
         if n_restarts < 1:
             raise ValueError("n_restarts must be >= 1")
-        if init not in ("unique", "uniform", "random"):
-            raise ValueError("init must be 'unique', 'uniform', or 'random'")
+        if init not in ("unique", "unique_psm", "uniform", "random"):
+            raise ValueError(
+                "init must be 'unique', 'unique_psm', 'uniform', or 'random'"
+            )
         if detectability_mode not in ("uniform", "sequence_features", "file"):
             raise ValueError(
                 "detectability_mode must be 'uniform', 'sequence_features', "
@@ -163,6 +198,14 @@ class AbundanceEM:
             raise ValueError(
                 "detectability_file is required when detectability_mode='file'"
             )
+        if prior_mode not in ("symmetric", "empirical_bayes"):
+            raise ValueError(
+                "prior_mode must be 'symmetric' or 'empirical_bayes'"
+            )
+        if prior_kappa < 0:
+            raise ValueError("prior_kappa must be >= 0")
+        if prior_alpha0 <= 0:
+            raise ValueError("prior_alpha0 must be > 0")
 
         self.alpha = float(alpha)
         self.max_iter = int(max_iter)
@@ -178,6 +221,9 @@ class AbundanceEM:
             if detectability_weights is not None
             else None
         )
+        self.prior_mode = prior_mode
+        self.prior_kappa = float(prior_kappa)
+        self.prior_alpha0 = float(prior_alpha0)
 
         # Set after fit().
         self.pi_: Optional[np.ndarray] = None
@@ -201,6 +247,11 @@ class AbundanceEM:
         self._y: Optional[np.ndarray] = None
         self._taxon_names: Optional[list] = None
         self._W: Optional[np.ndarray] = None
+        # Per-taxon Dirichlet concentration vector ``a_t`` used in the M-step.
+        # Built once per ``fit`` call after the matrices are known. In the
+        # symmetric mode this is the constant ``alpha`` vector; in the
+        # empirical-Bayes mode it is ``prior_kappa * pi_hat_unique + prior_alpha0``.
+        self._prior_alpha_vec: Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ public
 
@@ -278,6 +329,14 @@ class AbundanceEM:
 
         # Build the (possibly detectability-weighted) emission matrix.
         W = self._build_emission_matrix(A_bin, M, peptide_sequences)
+
+        # Build the per-taxon Dirichlet concentration vector ``a_t``.  In the
+        # symmetric mode this is a constant ``alpha`` vector (so the M-step
+        # and log-posterior reduce exactly to the legacy expressions); in the
+        # empirical-Bayes mode it is anchored on the PSM-weighted unique
+        # vector.  Computed ONCE so the EM loop and log-posterior share a
+        # consistent prior.
+        self._prior_alpha_vec = self._build_prior_alpha_vec(A_bin, y_arr, T)
 
         # Edge case: T == 1 forces pi = [1.0]; skip EM entirely.
         if T == 1:
@@ -486,6 +545,42 @@ class AbundanceEM:
         return W
 
     @staticmethod
+    def _compute_unique_psm_vector(A: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Per-taxon sum of PSM counts over peptides that are unique to it.
+
+        A peptide ``p`` is "unique to taxon ``t``" when its row of ``A`` is
+        non-zero only in column ``t`` (``sum_{t'} A[p, t'] == 1`` and
+        ``A[p, t] == 1``). For each taxon this returns ``sum_{p in U_t} y_p``
+        — the raw, unnormalised PSM-weighted unique-peptide signal. Callers
+        that need a probability vector should add an epsilon and normalise.
+
+        Both the ``init='unique_psm'`` initialiser and the empirical-Bayes
+        prior anchor share this computation so they cannot drift apart.
+
+        Parameters
+        ----------
+        A : np.ndarray, shape ``(P, T)``
+            Binary mapping matrix (any non-zero entry is treated as 1).
+        y : np.ndarray, shape ``(P,)``
+            Spectral count vector.
+
+        Returns
+        -------
+        np.ndarray, shape ``(T,)``
+            ``sum_{p in U_t} y_p`` for each taxon ``t``. Non-negative.
+        """
+        A_bin = (np.asarray(A) != 0).astype(np.float64)
+        y_arr = np.asarray(y, dtype=np.float64)
+        # ``unique_mask[p] == True`` iff peptide p maps to exactly one taxon.
+        unique_mask = (A_bin.sum(axis=1) == 1.0)
+        if not unique_mask.any():
+            return np.zeros(A_bin.shape[1], dtype=np.float64)
+        # Restrict to unique peptides, then (y * column) summed per taxon
+        # gives sum_{p in U_t} y_p because A_bin[p, t] is 0/1 on that slice.
+        y_weighted = (y_arr * unique_mask)
+        return (A_bin * y_weighted[:, np.newaxis]).sum(axis=0)
+
+    @staticmethod
     def _initial_pi(
         strategy: str,
         T: int,
@@ -505,6 +600,13 @@ class AbundanceEM:
             mask = y > 0
             weights = (A[mask, :] > 0).sum(axis=0).astype(np.float64)
             weights = weights + 1e-3  # epsilon avoids zero rows
+            return weights / weights.sum()
+        if strategy == "unique_psm":
+            # PSM-weighted variant: sum of y_p over unique peptides instead
+            # of the raw count.  Uses the same helper as the EB prior so the
+            # two cannot diverge.
+            weights = AbundanceEM._compute_unique_psm_vector(A, y)
+            weights = weights + 1e-3  # matches the eps used by "unique"
             return weights / weights.sum()
         raise ValueError(f"unknown init strategy: {strategy}")
 
@@ -558,8 +660,40 @@ class AbundanceEM:
             converged=converged,
         )
 
+    def _build_prior_alpha_vec(
+        self, A: np.ndarray, y: np.ndarray, T: int,
+    ) -> np.ndarray:
+        """Per-taxon Dirichlet concentration vector ``a_t`` for the M-step.
+
+        ``"symmetric"``      -> ``a_t = alpha`` for every t (legacy behavior).
+        ``"empirical_bayes"`` -> ``a_t = prior_kappa * pi_hat_unique[t] + prior_alpha0``,
+        where ``pi_hat_unique`` is built from the same PSM-weighted unique
+        signal used by ``init='unique_psm'`` (small epsilon + L1 normalise).
+        """
+        if self.prior_mode == "symmetric":
+            return np.full(T, self.alpha, dtype=np.float64)
+
+        raw = self._compute_unique_psm_vector(A, y)
+        # Match the epsilon used by the init path so the prior anchor is
+        # well-defined when some taxa have no unique PSMs.
+        raw = raw + 1e-3
+        pi_hat_unique = raw / raw.sum()
+        return self.prior_kappa * pi_hat_unique + self.prior_alpha0
+
     def _em_step(self, pi: np.ndarray, M: np.ndarray, y: np.ndarray) -> np.ndarray:
-        """One full EM iteration (E-step + M-step)."""
+        """One full EM iteration (E-step + M-step).
+
+        M-step (unified across prior modes):
+
+            pi_t^new = (C_t + a_t - 1) / (N + sum_t (a_t - 1))
+
+        where ``C_t = sum_p y_p r_{pt}`` is the expected count contributed to
+        taxon t and ``a_t`` is the per-taxon Dirichlet concentration computed
+        once by :meth:`_build_prior_alpha_vec`.  In the symmetric mode every
+        ``a_t == alpha`` and the denominator collapses to the legacy
+        ``N + T * (alpha - 1)`` form, reproducing the prior behaviour
+        bit-for-bit.
+        """
         T = pi.shape[0]
 
         # phi_p = sum_t pi_t * M_{pt}
@@ -574,16 +708,20 @@ class AbundanceEM:
         expected_counts_t = pi * col_sum  # sum_p c_{pt}
 
         N = float(y.sum())
-        prior_correction = self.alpha - 1.0
-        denom = N + T * prior_correction
+        a_vec = self._prior_alpha_vec
+        if a_vec is None:  # defensive — fit() always sets this before EM
+            a_vec = np.full(T, self.alpha, dtype=np.float64)
+        prior_correction = a_vec - 1.0  # per-taxon (a_t - 1)
+        denom = N + float(prior_correction.sum())
         if denom <= 0:
             # Pathological combination of small N and very sparse prior.
             denom = max(denom, _EPS)
         numer = expected_counts_t + prior_correction
         pi_new = numer / denom
 
-        # Clamp negative entries that arise when alpha < 1 and a taxon picks
-        # up almost no expected counts. Renormalize so we stay on the simplex.
+        # Clamp negative entries that arise when any a_t < 1 and a taxon
+        # picks up almost no expected counts. Renormalize so we stay on the
+        # simplex.
         pi_new = np.maximum(pi_new, _EPS)
         pi_new = pi_new / pi_new.sum()
         return pi_new
@@ -600,7 +738,12 @@ class AbundanceEM:
     def _log_posterior(self, pi: np.ndarray, M: np.ndarray, y: np.ndarray) -> float:
         """Log-posterior up to a normalization constant.
 
-        log p(pi | y) propto sum_p y_p log(phi_p) + (alpha - 1) sum_t log pi_t.
+            log p(pi | y) propto  sum_p y_p log(phi_p)
+                                + sum_t (a_t - 1) * log pi_t
+
+        In the symmetric mode every ``a_t == alpha`` and the prior term
+        reduces to ``(alpha - 1) * sum_t log pi_t``; in the empirical-Bayes
+        mode each taxon contributes its own per-taxon weight.
         """
         phi = M @ pi
         phi = np.maximum(phi, _EPS)
@@ -609,7 +752,10 @@ class AbundanceEM:
         # contribute the same constant under both old and new pi (both at
         # _EPS), so the monotonicity check is preserved.
         pi_safe = np.maximum(pi, _EPS)
-        prior = float((self.alpha - 1.0) * np.sum(np.log(pi_safe)))
+        a_vec = self._prior_alpha_vec
+        if a_vec is None:
+            a_vec = np.full(pi.shape[0], self.alpha, dtype=np.float64)
+        prior = float(np.sum((a_vec - 1.0) * np.log(pi_safe)))
         return ll + prior
 
     def _compute_standard_errors(

@@ -41,6 +41,27 @@ class AbundanceEMPlugin(TaxonPlugin):
         FASTA parsing (default ``["DECOY", "contag"]``).
     alpha : float
         Dirichlet prior hyperparameter (default ``0.5``, sparsity-inducing).
+        Used as the symmetric Dirichlet concentration when
+        ``prior_mode='symmetric'``; ignored when ``prior_mode='empirical_bayes'``.
+    prior_mode : str
+        Form of the Dirichlet prior.  ``"symmetric"`` (default) uses
+        ``Dir(alpha, ..., alpha)`` and reproduces legacy behavior.
+        ``"empirical_bayes"`` uses an asymmetric prior whose per-taxon
+        concentration is ``prior_kappa * pi_hat_unique + prior_alpha0``,
+        anchored on the PSM-weighted unique-peptide vector.
+    prior_kappa : float
+        Concentration of the empirical-Bayes prior (default ``0.0``).
+        Larger values pull the M-step output more strongly toward the
+        unique-PSM signal.  Only consulted when
+        ``prior_mode='empirical_bayes'``.
+    prior_alpha0 : float
+        Symmetric baseline of the empirical-Bayes prior (default ``0.5``).
+        Only consulted when ``prior_mode='empirical_bayes'``.
+    init_strategy : str
+        EM initialisation mode (default ``"unique"``).  Options:
+        ``"unique"`` (count of unique peptides with nonzero PSMs),
+        ``"unique_psm"`` (sum of PSMs over unique peptides — same anchor as
+        the EB prior), ``"uniform"`` (1/T), ``"random"`` (Dirichlet(1)).
     max_iter : int
         Maximum EM iterations (default ``500``).
     tol : float
@@ -109,7 +130,14 @@ class AbundanceEMPlugin(TaxonPlugin):
     # ----------------------------------------------------------------- API
 
     def validate_config(self, config: dict) -> bool:
-        """Check that ``fasta_path`` (and optionally ``pepxml_path``) exist."""
+        """Check that ``fasta_path`` (and optionally ``pepxml_path``) exist.
+
+        Also type-checks the new prior knobs (``prior_mode``, ``prior_kappa``,
+        ``prior_alpha0``) and the extended ``init_strategy`` enum: an
+        unrecognised ``prior_mode`` raises ``ValueError`` so the caller learns
+        about the typo immediately instead of getting a confusing failure
+        later inside the model.
+        """
         fasta_path = config.get("fasta_path")
         if not fasta_path:
             return False
@@ -118,6 +146,51 @@ class AbundanceEMPlugin(TaxonPlugin):
         pepxml_path = config.get("pepxml_path")
         if pepxml_path and not Path(str(pepxml_path)).is_file():
             return False
+
+        # init_strategy enum (kept here so an unknown value surfaces during
+        # the registry-level validation pass, not deep inside ``run``).
+        init_strategy = config.get("init_strategy")
+        if init_strategy is not None and init_strategy not in (
+            "unique", "unique_psm", "uniform", "random",
+        ):
+            raise ValueError(
+                f"init_strategy must be one of "
+                f"'unique', 'unique_psm', 'uniform', 'random'; got {init_strategy!r}"
+            )
+
+        # New prior knobs.
+        prior_mode = config.get("prior_mode")
+        if prior_mode is not None and prior_mode not in (
+            "symmetric", "empirical_bayes",
+        ):
+            raise ValueError(
+                f"prior_mode must be 'symmetric' or 'empirical_bayes'; "
+                f"got {prior_mode!r}"
+            )
+        prior_kappa = config.get("prior_kappa")
+        if prior_kappa is not None:
+            try:
+                kappa_f = float(prior_kappa)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"prior_kappa must be a non-negative number; got {prior_kappa!r}"
+                ) from exc
+            if kappa_f < 0:
+                raise ValueError(
+                    f"prior_kappa must be >= 0; got {prior_kappa!r}"
+                )
+        prior_alpha0 = config.get("prior_alpha0")
+        if prior_alpha0 is not None:
+            try:
+                alpha0_f = float(prior_alpha0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"prior_alpha0 must be a positive number; got {prior_alpha0!r}"
+                ) from exc
+            if alpha0_f <= 0:
+                raise ValueError(
+                    f"prior_alpha0 must be > 0; got {prior_alpha0!r}"
+                )
         return True
 
     def run(self, peptides: list, config: dict) -> list:
@@ -166,6 +239,21 @@ class AbundanceEMPlugin(TaxonPlugin):
         generate_plot = bool(config.get("generate_plot", True))
         plot_top_n = int(config.get("plot_top_n", 15))
         unified_table = bool(config.get("unified_table", True))
+
+        # Prior knobs (Cycle 7).  ``prior_mode='symmetric'`` reproduces the
+        # legacy single-alpha Dirichlet; ``empirical_bayes`` anchors the
+        # per-taxon prior on the PSM-weighted unique-peptide vector.  The
+        # validate_config pass above has already enforced the ``prior_mode``
+        # enum, so we re-validate here only as a defensive guard for callers
+        # that bypass validate_config.
+        prior_mode = str(config.get("prior_mode", "symmetric"))
+        if prior_mode not in ("symmetric", "empirical_bayes"):
+            raise ValueError(
+                f"prior_mode must be 'symmetric' or 'empirical_bayes'; "
+                f"got {prior_mode!r}"
+            )
+        prior_kappa = float(config.get("prior_kappa", 0.0))
+        prior_alpha0 = float(config.get("prior_alpha0", 0.5))
 
         min_probability_raw = config.get("min_probability")
         min_probability = float(min_probability_raw) if min_probability_raw is not None else None
@@ -312,6 +400,9 @@ class AbundanceEMPlugin(TaxonPlugin):
             seed=seed,
             detectability_mode=detectability_mode,
             detectability_file=detectability_file,
+            prior_mode=prior_mode,
+            prior_kappa=prior_kappa,
+            prior_alpha0=prior_alpha0,
         )
         model.fit(A, y, peptide_sequences=peptide_list, taxon_labels=taxon_labels)
         logger.info(

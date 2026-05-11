@@ -44,6 +44,10 @@ _ENV_VAR_MAP: dict[str, str] = {
     "n_restarts": "TAXON_EM_N_RESTARTS",
     "init_strategy": "TAXON_EM_INIT",
     "abundance_threshold": "TAXON_EM_ABUNDANCE_THRESHOLD",
+    # Cycle 7 prior knobs.
+    "prior_mode": "TAXON_EM_PRIOR_MODE",
+    "prior_kappa": "TAXON_EM_PRIOR_KAPPA",
+    "prior_alpha0": "TAXON_EM_PRIOR_ALPHA0",
     "min_psm_threshold": "TAXON_MIN_PSM_THRESHOLD",
     "target_fdr": "TAXON_TARGET_FDR",
     "generate_plot": "TAXON_GENERATE_PLOT",
@@ -99,6 +103,13 @@ def _flatten_yaml_config(raw: dict) -> dict[str, Any]:
         "n_restarts": ("n_restarts", int),
         "init_strategy": ("init_strategy", str),
         "abundance_threshold": ("abundance_threshold", float),
+        # Cycle 7 prior knobs. ``prior_mode`` is forwarded as a string and
+        # validated downstream (the plugin's ``validate_config`` raises on
+        # unknown values, so a typo here surfaces at run-time rather than
+        # silently disabling the EB prior).
+        "prior_mode": ("prior_mode", str),
+        "prior_kappa": ("prior_kappa", float),
+        "prior_alpha0": ("prior_alpha0", float),
     }
     for src, (dst, cast) in em_to_flat.items():
         if em.get(src) is not None:
@@ -208,6 +219,9 @@ def _serialize_run_config(config: dict[str, Any], path: Path) -> None:
     for k in (
         "alpha", "max_iter", "tol", "n_restarts",
         "init_strategy", "abundance_threshold",
+        # Cycle 7 prior knobs — round-trip back into ``em:`` so
+        # run_config.yaml records the actual prior used.
+        "prior_mode", "prior_kappa", "prior_alpha0",
     ):
         if k in flat:
             em[k] = flat.pop(k)

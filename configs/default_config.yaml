@@ -25,12 +25,16 @@ corrections:
 
 # --- EM Algorithm ---
 em:
-  alpha: 0.5                   # Dirichlet prior hyperparameter
+  alpha: 0.5                   # Dirichlet prior hyperparameter (symmetric mode)
   max_iter: 500                # Maximum EM iterations
   tol: 1.0e-6                  # L1 convergence tolerance
   n_restarts: 1                # Number of random restarts
-  init_strategy: unique        # unique | uniform | random
+  init_strategy: unique        # unique | unique_psm | uniform | random
   abundance_threshold: 1.0e-4  # Post-convergence zeroing threshold
+  # --- Prior (Cycle 7) ---
+  prior_mode: symmetric        # symmetric | empirical_bayes
+  prior_kappa: 0.0             # EB prior concentration (empirical_bayes only)
+  prior_alpha0: 0.5            # EB prior symmetric baseline (empirical_bayes only)
 
 # --- Output Options ---
 output:

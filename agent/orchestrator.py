@@ -329,6 +329,10 @@ class Orchestrator:
             ("TAXON_EM_N_RESTARTS", "n_restarts", int),
             ("TAXON_EM_INIT", "init_strategy", str),
             ("TAXON_EM_ABUNDANCE_THRESHOLD", "min_abundance", float),
+            # Cycle 7 prior knobs — symmetric vs empirical-Bayes Dirichlet.
+            ("TAXON_EM_PRIOR_MODE", "prior_mode", str),
+            ("TAXON_EM_PRIOR_KAPPA", "prior_kappa", float),
+            ("TAXON_EM_PRIOR_ALPHA0", "prior_alpha0", float),
         )
         for env_name, key, cast in em_env_map:
             if key in params and params[key] is not None:
