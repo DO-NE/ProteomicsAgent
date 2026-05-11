@@ -57,9 +57,13 @@ HMM_PROFILE_HINT = (
 class MarkerSearchResult:
     """Result bundle returned by :func:`run_hmmsearch`."""
 
-    # protein_accession -> (taxon_label, [marker_family, ...], e_value, score)
-    # The family list is ordered best-score first; multi-domain proteins
-    # accumulate all matching HMM family names rather than just the best.
+    # protein_accession -> (taxon_label, [marker_family], e_value, score)
+    # The family list contains exactly ONE entry — the single best
+    # hmmsearch hit for that protein (lowest E-value, ties broken by
+    # highest bit score, then lexicographically on family name).  This is
+    # the post-Cycle-7 best-family-per-protein policy that prevents
+    # multi-domain proteins from inflating |F_t|; see audit findings
+    # C2 + D3.
     marker_proteins: dict = field(default_factory=dict)
     # taxon_label -> set of marker_family names found in that taxon
     taxon_marker_families: dict = field(default_factory=dict)
@@ -322,6 +326,23 @@ def _aggregate_hits(
     accession against the per-taxon protein index from the mapping-matrix
     build to assign a taxon label.  Targets not present in any taxon
     bucket get the empty-string label.
+
+    Best-family-per-protein policy
+    ------------------------------
+    Each protein is assigned to **exactly one** marker family — the
+    single best hmmsearch hit by (lowest E-value, highest bit score,
+    lexicographically smallest family name as the final tie-break).
+    Multi-domain proteins that pass the E-value threshold for several
+    HMM profiles therefore no longer contribute to multiple family
+    counters downstream.  This closes audit findings C2 + D3 (without
+    this policy, a single ribosomal cross-hit could lift
+    ``marker_families_per_taxon[t]`` past the |F_t|>=3 qualifying
+    threshold from fewer than 3 truly independent markers).
+
+    The ``family_proteins`` and ``taxon_marker_families`` aggregates
+    are still built from the full per-(target, query) hit set so
+    diagnostic "which families fired in this taxon" reporting reflects
+    every match HMMER produced — only ``marker_proteins`` is collapsed.
     """
     # Reverse index: protein_accession -> taxon_label.  The matrix build
     # may bucket the same accession under multiple labels (rare); pick
@@ -342,35 +363,44 @@ def _aggregate_hits(
         if prev is None or (h["evalue"] < prev["evalue"]):
             best[key] = h
 
-    marker_proteins: dict = {}
+    # ``family_proteins`` and ``taxon_marker_families`` use every hit so
+    # diagnostic dumps stay informative; only ``marker_proteins`` is
+    # collapsed to the single best family below.
     family_proteins: dict = {}
     taxon_marker_families: dict = {}
-
-    for (target, query), h in best.items():
-        # Record all matching family names for multi-domain proteins so
-        # downstream family counters see every membership, not just the
-        # best-scoring one.  The family list is ordered best-score first.
+    for (target, query), _h in best.items():
         family_proteins.setdefault(query, set()).add(target)
-
         label = acc_to_label.get(target, "")
         if label:
             taxon_marker_families.setdefault(label, set()).add(query)
 
-        existing = marker_proteins.get(target)
-        if existing is None:
-            marker_proteins[target] = (label, [query], h["evalue"], h["score"])
-        else:
-            ex_label, ex_families, ex_evalue, ex_score = existing
-            new_families = list(ex_families)
-            if query not in new_families:
-                if h["evalue"] < ex_evalue:
-                    new_families.insert(0, query)
-                else:
-                    new_families.append(query)
-            if h["evalue"] < ex_evalue:
-                marker_proteins[target] = (ex_label, new_families, h["evalue"], h["score"])
-            else:
-                marker_proteins[target] = (ex_label, new_families, ex_evalue, ex_score)
+    # Bucket hits by target accession, then pick the single best family
+    # per target.  The "best" key is (evalue ASC, -score, family ASC)
+    # so lower E-value wins, then higher bit score, then lex.
+    hits_by_target: dict = {}
+    for (target, query), h in best.items():
+        hits_by_target.setdefault(target, []).append((query, h))
+
+    marker_proteins: dict = {}
+    for target, q_list in hits_by_target.items():
+        q_list.sort(
+            key=lambda qh: (float(qh[1]["evalue"]), -float(qh[1]["score"]), qh[0])
+        )
+        best_query, best_h = q_list[0]
+        label = acc_to_label.get(target, "")
+        marker_proteins[target] = (
+            label,
+            [best_query],
+            best_h["evalue"],
+            best_h["score"],
+        )
+
+    # Invariant: every protein contributes to exactly one family.
+    for _target, payload in marker_proteins.items():
+        assert len(payload[1]) == 1, (
+            "best-family-per-protein invariant violated: "
+            f"{_target!r} -> {payload!r}"
+        )
 
     return MarkerSearchResult(
         marker_proteins=marker_proteins,

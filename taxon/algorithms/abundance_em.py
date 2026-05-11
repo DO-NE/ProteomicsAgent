@@ -629,6 +629,19 @@ class AbundanceEMPlugin(TaxonPlugin):
             if output_dir_cfg else None
         )
 
+        # ``marker_min_family_signal`` is exposed via YAML / CLI / env in
+        # main.py and the orchestrator does not currently relay it into
+        # ``config``, so we also accept the env var directly here. Order of
+        # precedence: explicit config key > env var > default 0.5.
+        import os as _os  # local import keeps the plugin import-light
+        _mfs_env = _os.getenv("TAXON_MARKER_MIN_FAMILY_SIGNAL")
+        if "marker_min_family_signal" in config and config["marker_min_family_signal"] is not None:
+            _mfs = float(config["marker_min_family_signal"])
+        elif _mfs_env is not None and _mfs_env != "":
+            _mfs = float(_mfs_env)
+        else:
+            _mfs = 0.5
+
         result = compute_cell_equivalent_abundance(
             pi=model.pi_,
             responsibilities=model.responsibilities_,
@@ -640,6 +653,7 @@ class AbundanceEMPlugin(TaxonPlugin):
             taxon_protein_peptides=mapping_result.taxon_protein_peptides,
             min_marker_families=int(config.get("min_marker_families", 3)),
             min_marker_psms=float(config.get("min_marker_psms", 1.0)),
+            min_family_signal=_mfs,
             taxon_kingdom=taxon_kingdom,
             marker_peptide_table_path=marker_peptide_table_path,
         )

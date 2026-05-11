@@ -36,6 +36,7 @@ _ENV_VAR_MAP: dict[str, str] = {
     "hmm_profile_dir": "TAXON_HMM_PROFILE_DIR",
     "min_marker_families": "TAXON_MARKER_MIN_FAMILIES",
     "min_marker_psms": "TAXON_MARKER_MIN_PSMS",
+    "marker_min_family_signal": "TAXON_MARKER_MIN_FAMILY_SIGNAL",
     "proteome_mass_correction": "TAXON_PROTEOME_MASS_CORRECTION",
     "genome_scaling_exponent": "TAXON_GENOME_SCALING_EXPONENT",
     "alpha": "TAXON_EM_ALPHA",
@@ -94,6 +95,8 @@ def _flatten_yaml_config(raw: dict) -> dict[str, Any]:
         flat["min_marker_families"] = int(marker["min_marker_families"])
     if marker.get("min_marker_psms") is not None:
         flat["min_marker_psms"] = float(marker["min_marker_psms"])
+    if marker.get("min_family_signal") is not None:
+        flat["marker_min_family_signal"] = float(marker["min_family_signal"])
 
     em = raw.get("em") or {}
     em_to_flat = {
@@ -207,6 +210,7 @@ def _serialize_run_config(config: dict[str, Any], path: Path) -> None:
         ("hmm_profile_dir", "hmm_profile_dir"),
         ("min_marker_families", "min_marker_families"),
         ("min_marker_psms", "min_marker_psms"),
+        ("marker_min_family_signal", "min_family_signal"),
     ):
         if k_in in flat:
             marker[k_out] = flat.pop(k_in)
@@ -408,6 +412,39 @@ def cli() -> None:
     ),
 )
 @click.option(
+    "--marker-min-families",
+    "min_marker_families",
+    type=int,
+    default=None,
+    help=(
+        "f_min: minimum number of marker families with signal > "
+        "--marker-min-family-signal that a taxon must have to receive a "
+        "marker-based estimate (default 3)."
+    ),
+)
+@click.option(
+    "--marker-min-psms",
+    "min_marker_psms",
+    type=float,
+    default=None,
+    help=(
+        "s_min: minimum total fractional marker PSM count for a taxon to "
+        "receive a marker-based estimate (default 1.0)."
+    ),
+)
+@click.option(
+    "--marker-min-family-signal",
+    "marker_min_family_signal",
+    type=float,
+    default=None,
+    help=(
+        "Per-family EM-weighted PSM threshold (default 0.5). A marker "
+        "family counts toward |F_t| only when its signal in that taxon "
+        "strictly exceeds this value — guards against trace responsibility "
+        "leakage from spuriously qualifying families."
+    ),
+)
+@click.option(
     "--proteome-mass-correction/--no-proteome-mass-correction",
     default=None,
     help="Enable proteome-size-weighted protein-biomass abundance correction",
@@ -464,6 +501,9 @@ def run_cmd(
     taxon_level: str | None,
     marker_correction: bool | None,
     hmm_profile_dir: Path | None,
+    min_marker_families: int | None,
+    min_marker_psms: float | None,
+    marker_min_family_signal: float | None,
     proteome_mass_correction: bool | None,
     genome_scaling_exponent: float | None,
     min_psm_threshold: int | None,
@@ -484,6 +524,9 @@ def run_cmd(
         "taxon_level": taxon_level,
         "marker_correction": marker_correction,
         "hmm_profile_dir": str(hmm_profile_dir) if hmm_profile_dir else None,
+        "min_marker_families": min_marker_families,
+        "min_marker_psms": min_marker_psms,
+        "marker_min_family_signal": marker_min_family_signal,
         "proteome_mass_correction": proteome_mass_correction,
         "genome_scaling_exponent": genome_scaling_exponent,
         "min_psm_threshold": min_psm_threshold,
@@ -670,6 +713,39 @@ def start_server_cmd() -> None:
     help="Directory with GTDB bac120/ar53 HMM bundles (used with --marker-correction).",
 )
 @click.option(
+    "--marker-min-families",
+    "min_marker_families",
+    type=int,
+    default=None,
+    help=(
+        "f_min: minimum number of marker families with signal > "
+        "--marker-min-family-signal that a taxon must have to receive a "
+        "marker-based estimate (default 3)."
+    ),
+)
+@click.option(
+    "--marker-min-psms",
+    "min_marker_psms",
+    type=float,
+    default=None,
+    help=(
+        "s_min: minimum total fractional marker PSM count for a taxon to "
+        "receive a marker-based estimate (default 1.0)."
+    ),
+)
+@click.option(
+    "--marker-min-family-signal",
+    "marker_min_family_signal",
+    type=float,
+    default=None,
+    help=(
+        "Per-family EM-weighted PSM threshold (default 0.5). A marker "
+        "family counts toward |F_t| only when its signal in that taxon "
+        "strictly exceeds this value — guards against trace responsibility "
+        "leakage from spuriously qualifying families."
+    ),
+)
+@click.option(
     "--proteome-mass-correction/--no-proteome-mass-correction",
     default=None,
     help="Enable proteome-size-weighted protein-biomass abundance correction",
@@ -724,6 +800,9 @@ def run_pipeline_cmd(
     taxon_level: str | None,
     marker_correction: bool | None,
     hmm_profile_dir: Path | None,
+    min_marker_families: int | None,
+    min_marker_psms: float | None,
+    marker_min_family_signal: float | None,
     proteome_mass_correction: bool | None,
     genome_scaling_exponent: float | None,
     min_psm_threshold: int | None,
@@ -744,6 +823,9 @@ def run_pipeline_cmd(
         "taxon_level": taxon_level,
         "marker_correction": marker_correction,
         "hmm_profile_dir": str(hmm_profile_dir) if hmm_profile_dir else None,
+        "min_marker_families": min_marker_families,
+        "min_marker_psms": min_marker_psms,
+        "marker_min_family_signal": marker_min_family_signal,
         "proteome_mass_correction": proteome_mass_correction,
         "genome_scaling_exponent": genome_scaling_exponent,
         "min_psm_threshold": min_psm_threshold,

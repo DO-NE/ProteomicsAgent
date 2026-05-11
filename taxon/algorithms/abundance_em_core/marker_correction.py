@@ -20,6 +20,16 @@ where ``y_p`` is the observed PSM count of peptide ``p`` and
 ``r_{pt}`` is the EM responsibility (so shared marker peptides are
 fractionally assigned by the EM rather than discarded).  Taxa that
 fail minimum-evidence thresholds fall back to their ``pi_t`` value.
+
+Operational qualifying rule (Cycle 7)
+-------------------------------------
+A taxon t qualifies for marker-based estimation iff
+  |{f : family_signal[f][t] > min_family_signal}| >= min_marker_families
+  AND  s_t >= min_marker_psms
+where each marker protein contributes to exactly one family (its best
+hmmsearch hit by E-value), and family_signal[f][t] is the sum of
+y_p * r*_pt over peptides p derived from family f's marker proteins
+in taxon t.
 """
 
 from __future__ import annotations
@@ -47,7 +57,7 @@ class MarkerCorrectionResult:
     cell_abundance: np.ndarray            # (T,) cell-equivalent rel. abundance
     psm_abundance: np.ndarray             # (T,) original pi from the EM
     marker_signal: np.ndarray             # (T,) Σ_p y_p * r_{pt} over marker p
-    marker_families_per_taxon: np.ndarray  # (T,) int, distinct families w/ signal > 0.5
+    marker_families_per_taxon: np.ndarray  # (T,) int, distinct families w/ signal > min_family_signal
     marker_psm_count: np.ndarray          # (T,) fractional marker PSM count
     marker_peptides_per_taxon: np.ndarray  # (T,) unique marker peptides w/ r > 0
     taxon_labels: list                    # column-aligned label strings
@@ -71,6 +81,7 @@ def compute_cell_equivalent_abundance(
     taxon_protein_peptides: dict,
     min_marker_families: int = 3,
     min_marker_psms: float = 1.0,
+    min_family_signal: float = 0.5,
     taxon_kingdom: Optional[dict] = None,
     exclude_kingdoms: frozenset = frozenset({"Eukaryota"}),
     emit_marker_peptide_table: bool = True,
@@ -119,10 +130,15 @@ def compute_cell_equivalent_abundance(
         Provided by :class:`MappingMatrixResult`.
     min_marker_families : int, default ``3``
         Minimum number of distinct marker families with nontrivial signal
-        (per-taxon family signal > 0.5) required for a taxon to receive a
-        marker-based estimate.
+        (per-taxon family signal > ``min_family_signal``) required for a
+        taxon to receive a marker-based estimate.
     min_marker_psms : float, default ``1.0``
         Minimum total fractional marker PSM count for a taxon.
+    min_family_signal : float, default ``0.5``
+        A marker family counts toward |F_t| only if its EM-weighted signal
+        contribution to taxon t exceeds min_family_signal PSMs (default 0.5).
+        This prevents trace responsibility leakage from spuriously qualifying
+        families.
     emit_marker_peptide_table : bool, default ``True``
         When *True* and *marker_peptide_table_path* is set, dump a
         per-(taxon, marker_family, marker_protein_accession,
@@ -273,14 +289,15 @@ def compute_cell_equivalent_abundance(
                 family_signal[f][int(t)] += float(contributions[t])
 
     # ------------------------------------------------------------------ step 4
-    # Distinct families with non-trivial signal per taxon.  Threshold of
-    # 0.5 fractional PSMs aligns with the marker_psm_count threshold —
-    # families contributing less than half a PSM are below noise.
+    # Distinct families with non-trivial signal per taxon.  Default threshold
+    # of 0.5 fractional PSMs aligns with the marker_psm_count threshold —
+    # families contributing less than half a PSM are below noise.  Exposed
+    # as ``min_family_signal`` so it can be tuned per-run.
     marker_families_per_taxon = np.zeros(T, dtype=np.int64)
     family_signal_per_taxon: dict = defaultdict(dict)
     for f, t_sig in family_signal.items():
         for t, sig in t_sig.items():
-            if sig > 0.5:
+            if sig > min_family_signal:
                 marker_families_per_taxon[t] += 1
             family_signal_per_taxon[taxon_labels[t]][f] = sig
 
