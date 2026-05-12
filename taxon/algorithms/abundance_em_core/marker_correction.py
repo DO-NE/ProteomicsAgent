@@ -30,6 +30,17 @@ where each marker protein contributes to exactly one family (its best
 hmmsearch hit by E-value), and family_signal[f][t] is the sum of
 y_p * r*_pt over peptides p derived from family f's marker proteins
 in taxon t.
+
+Three-subset extension (Cycle 8)
+--------------------------------
+``compute_cell_equivalent_abundance`` now accepts an optional
+``subset_families`` argument that emits a ``c_t`` vector per family
+subset (typically ``all`` / ``ribo`` / ``nayfach``) in a single pass.
+Each subset has its own qualifying rule applied against the same
+``min_marker_families`` and ``min_marker_psms`` thresholds — only the
+family universe changes.  The default ``subset_families=None`` keeps
+the legacy single-vector behaviour and returns ``c_t`` aliased as
+``cell_abundance``.
 """
 
 from __future__ import annotations
@@ -46,28 +57,58 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class SubsetMetrics:
+    """Per-subset cell-equivalent abundance bundle.
+
+    A :class:`MarkerCorrectionResult` carries one ``SubsetMetrics`` per
+    family subset (``"all"``, ``"ribo"``, ``"nayfach"``); all vectors are
+    aligned with the EM mapping-matrix column order.
+    """
+
+    cell_abundance: np.ndarray            # (T,) cell-equivalent rel. abundance
+    marker_signal: np.ndarray             # (T,) s_t restricted to this subset
+    marker_families_per_taxon: np.ndarray  # (T,) int, distinct families w/ signal > min_family_signal
+    has_marker_estimate: np.ndarray       # (T,) bool — passed thresholds
+    # ``label -> {family: signal}`` restricted to families in this subset.
+    family_signal_per_taxon: dict = field(default_factory=dict)
+
+
+@dataclass
 class MarkerCorrectionResult:
     """Output of :func:`compute_cell_equivalent_abundance`.
 
     All vector attributes are aligned with the column order of the EM
     mapping matrix: ``cell_abundance[t]`` corresponds to
     ``taxon_labels[t]``.
+
+    Back-compat
+    -----------
+    The top-level ``cell_abundance``, ``marker_signal``,
+    ``marker_families_per_taxon``, ``has_marker_estimate`` and
+    ``family_signal_per_taxon`` fields are kept as aliases of
+    ``subsets["all"]`` so existing downstream code keeps working.
     """
 
-    cell_abundance: np.ndarray            # (T,) cell-equivalent rel. abundance
+    cell_abundance: np.ndarray            # (T,) cell-equivalent rel. abundance — alias of subsets["all"]
     psm_abundance: np.ndarray             # (T,) original pi from the EM
-    marker_signal: np.ndarray             # (T,) Σ_p y_p * r_{pt} over marker p
-    marker_families_per_taxon: np.ndarray  # (T,) int, distinct families w/ signal > min_family_signal
-    marker_psm_count: np.ndarray          # (T,) fractional marker PSM count
+    marker_signal: np.ndarray             # (T,) Σ_p y_p * r_{pt} over marker p — alias of subsets["all"]
+    marker_families_per_taxon: np.ndarray  # (T,) int, distinct families w/ signal > min_family_signal — alias of subsets["all"]
+    marker_psm_count: np.ndarray          # (T,) fractional marker PSM count (subset-agnostic)
     marker_peptides_per_taxon: np.ndarray  # (T,) unique marker peptides w/ r > 0
     taxon_labels: list                    # column-aligned label strings
-    has_marker_estimate: np.ndarray       # (T,) bool — passed thresholds
+    has_marker_estimate: np.ndarray       # (T,) bool — passed thresholds — alias of subsets["all"]
     total_marker_psms: float              # global Σ marker_psm_count
     total_marker_peptides: int            # # unique marker peptide rows used
     fraction_psms_from_markers: float     # total_marker_psms / Σ y
     # Per-taxon family hit map: ``label -> {family: signal}``.  Useful
     # for diagnostics ("which markers fired in *Bacillus subtilis*?").
+    # Alias of subsets["all"].family_signal_per_taxon.
     family_signal_per_taxon: dict = field(default_factory=dict)
+    # Cycle-8 three-subset extension. ``subsets["all"]`` is always
+    # present (even in legacy single-subset mode); ``"ribo"`` and
+    # ``"nayfach"`` populate when the caller passes a ``subset_families``
+    # dict containing those keys.
+    subsets: dict = field(default_factory=dict)
 
 
 def compute_cell_equivalent_abundance(
@@ -86,6 +127,7 @@ def compute_cell_equivalent_abundance(
     exclude_kingdoms: frozenset = frozenset({"Eukaryota"}),
     emit_marker_peptide_table: bool = True,
     marker_peptide_table_path: Optional[str] = None,
+    subset_families: Optional[dict] = None,
 ) -> MarkerCorrectionResult:
     """Convert PSM-level ``pi`` to a cell-equivalent relative abundance.
 
@@ -150,6 +192,15 @@ def compute_cell_equivalent_abundance(
         default), no file is written even if *emit_marker_peptide_table*
         is *True* — this keeps the function suitable for unit tests and
         in-memory callers that have no output directory.
+    subset_families : dict[str, set[str] | None] or None, optional
+        Per-subset family restriction for the Cycle-8 three-subset
+        cell-equivalent abundance computation.  Keys are subset names
+        (typically ``"all"``, ``"ribo"``, ``"nayfach"``); a value of
+        ``None`` for any subset means "use every family observed"
+        (equivalent to the legacy default).  When ``subset_families``
+        itself is ``None`` (the default), only the legacy ``"all"``
+        subset is computed and aliased onto the top-level fields of
+        :class:`MarkerCorrectionResult`.
 
     Returns
     -------
@@ -288,55 +339,61 @@ def compute_cell_equivalent_abundance(
             for f in families:
                 family_signal[f][int(t)] += float(contributions[t])
 
-    # ------------------------------------------------------------------ step 4
-    # Distinct families with non-trivial signal per taxon.  Default threshold
-    # of 0.5 fractional PSMs aligns with the marker_psm_count threshold —
-    # families contributing less than half a PSM are below noise.  Exposed
-    # as ``min_family_signal`` so it can be tuned per-run.
-    marker_families_per_taxon = np.zeros(T, dtype=np.int64)
-    family_signal_per_taxon: dict = defaultdict(dict)
-    for f, t_sig in family_signal.items():
-        for t, sig in t_sig.items():
-            if sig > min_family_signal:
-                marker_families_per_taxon[t] += 1
-            family_signal_per_taxon[taxon_labels[t]][f] = sig
-
     for t, peps in used_peps_per_taxon.items():
         marker_peptides_per_taxon[t] = len(peps)
 
-    # ------------------------------------------------------------------ step 5
-    has_marker_estimate = (
-        (marker_families_per_taxon >= min_marker_families)
-        & (marker_psm_count >= min_marker_psms)
-    )
-    # Override: excluded-kingdom taxa (e.g. Eukaryota) never receive a
-    # marker-based estimate, regardless of signal strength.
-    for t in excluded_taxa:
-        has_marker_estimate[t] = False
-
-    # ------------------------------------------------------------------ step 6
-    # Compose c_t: marker-derived for qualifying taxa, pi-fallback for
-    # the rest, then renormalise.
-    cell_abundance = np.zeros(T, dtype=np.float64)
-    if has_marker_estimate.any():
-        sel_total = float(marker_signal[has_marker_estimate].sum())
-        if sel_total > 0:
-            cell_abundance[has_marker_estimate] = (
-                marker_signal[has_marker_estimate] / sel_total
-            )
-        else:
-            # All "qualifying" taxa actually have zero signal — pathological
-            # combination of thresholds and zero numerator; fall back to pi.
-            cell_abundance[has_marker_estimate] = pi[has_marker_estimate]
-    cell_abundance[~has_marker_estimate] = pi[~has_marker_estimate]
-
-    s = float(cell_abundance.sum())
-    if s > 0:
-        cell_abundance = cell_abundance / s
+    # ------------------------------------------------------------------ step 4
+    # Three-subset per-family-set restriction (Cycle 8).  When the caller
+    # passes ``subset_families``, we compute one ``SubsetMetrics`` per
+    # named subset (typically ``"all"``, ``"ribo"``, ``"nayfach"``) in
+    # the same pass.  When ``subset_families`` is None, we degenerate to
+    # the single ``"all"`` subset using every family observed — exactly
+    # the legacy behaviour.
+    if subset_families is None:
+        subset_specs: dict = {"all": None}
     else:
-        # No qualifying taxa, no fallback signal — degenerate.  Keep pi
-        # exactly to avoid handing back a NaN vector.
-        cell_abundance = pi.copy()
+        subset_specs = dict(subset_families)
+        # Always ensure an "all" entry exists for back-compat aliasing.
+        if "all" not in subset_specs:
+            subset_specs["all"] = None
+
+    subsets: dict = {}
+    for subset_name, fam_set in subset_specs.items():
+        sub_metrics = _compute_subset_metrics(
+            T=T,
+            family_signal=family_signal,
+            marker_signal=marker_signal,
+            marker_psm_count=marker_psm_count,
+            taxon_labels=list(taxon_labels),
+            pi=pi,
+            fam_set=fam_set,
+            min_family_signal=min_family_signal,
+            min_marker_families=min_marker_families,
+            min_marker_psms=min_marker_psms,
+            excluded_taxa=excluded_taxa,
+            peptide_to_families=peptide_to_families,
+            peptide_index=peptide_index,
+            spectral_counts=spectral_counts,
+            responsibilities=responsibilities,
+        )
+        subsets[subset_name] = sub_metrics
+        n_qual = int(sub_metrics.has_marker_estimate.sum())
+        mean_fams = (
+            float(sub_metrics.marker_families_per_taxon[sub_metrics.has_marker_estimate].mean())
+            if n_qual > 0 else 0.0
+        )
+        total_st = float(sub_metrics.marker_signal.sum())
+        logger.info(
+            "[c_t_%s] qualifying taxa: %d / %d; mean |F_t|=%.1f; total s_t=%.2f",
+            subset_name, n_qual, T, mean_fams, total_st,
+        )
+
+    # Top-level alias = "all" subset (always present).
+    all_metrics = subsets["all"]
+    cell_abundance = all_metrics.cell_abundance
+    marker_families_per_taxon = all_metrics.marker_families_per_taxon
+    has_marker_estimate = all_metrics.has_marker_estimate
+    family_signal_per_taxon = all_metrics.family_signal_per_taxon
 
     # ------------------------------------------------------------------ stats
     total_y = float(sum(spectral_counts.values()))
@@ -373,7 +430,7 @@ def compute_cell_equivalent_abundance(
     return MarkerCorrectionResult(
         cell_abundance=cell_abundance,
         psm_abundance=pi.copy(),
-        marker_signal=marker_signal,
+        marker_signal=all_metrics.marker_signal,
         marker_families_per_taxon=marker_families_per_taxon,
         marker_psm_count=marker_psm_count,
         marker_peptides_per_taxon=marker_peptides_per_taxon,
@@ -383,6 +440,108 @@ def compute_cell_equivalent_abundance(
         total_marker_peptides=n_marker_peptide_rows,
         fraction_psms_from_markers=fraction_psms_from_markers,
         family_signal_per_taxon=dict(family_signal_per_taxon),
+        subsets=subsets,
+    )
+
+
+def _compute_subset_metrics(
+    *,
+    T: int,
+    family_signal: dict,
+    marker_signal: np.ndarray,
+    marker_psm_count: np.ndarray,
+    taxon_labels: list,
+    pi: np.ndarray,
+    fam_set,
+    min_family_signal: float,
+    min_marker_families: int,
+    min_marker_psms: float,
+    excluded_taxa: set,
+    peptide_to_families: dict,
+    peptide_index: dict,
+    spectral_counts: dict,
+    responsibilities: np.ndarray,
+) -> "SubsetMetrics":
+    """Compute one ``SubsetMetrics`` block for a given family subset.
+
+    Parameters
+    ----------
+    fam_set : set[str] or None
+        If ``None``, use every family present in ``family_signal``
+        (the legacy "all" universe).  Otherwise restrict to ``fam_set``.
+
+    Notes
+    -----
+    The subset-restricted ``marker_signal`` is recomputed by replaying
+    the same y_p · r_pt accumulation, but only over peptides whose
+    family set intersects ``fam_set``.  This is slightly redundant for
+    the "all" subset (it could just reuse the precomputed
+    ``marker_signal`` argument), but the unified path keeps the code
+    simple and the cost is negligible — the inner loop is bounded by
+    the number of marker peptides.
+    """
+    # 1. Restrict family_signal -> filtered_family_signal.
+    if fam_set is None:
+        filtered = family_signal
+    else:
+        filtered = {f: tsig for f, tsig in family_signal.items() if f in fam_set}
+
+    # 2. |F_t|: distinct families in the subset with signal > min_family_signal.
+    families_per_taxon = np.zeros(T, dtype=np.int64)
+    fam_signal_per_taxon: dict = defaultdict(dict)
+    for f, t_sig in filtered.items():
+        for t, sig in t_sig.items():
+            if sig > min_family_signal:
+                families_per_taxon[t] += 1
+            fam_signal_per_taxon[taxon_labels[t]][f] = sig
+
+    # 3. s_t restricted to peptides whose family set intersects fam_set.
+    #    "all" reuses the precomputed marker_signal for efficiency.
+    if fam_set is None:
+        sub_marker_signal = marker_signal.copy()
+    else:
+        sub_marker_signal = np.zeros(T, dtype=np.float64)
+        for pep, families in peptide_to_families.items():
+            if not (families & fam_set):
+                continue
+            p_idx = peptide_index.get(pep.upper())
+            if p_idx is None:
+                continue
+            y_p = float(spectral_counts.get(pep.upper(), 0))
+            if y_p <= 0:
+                continue
+            r_row = np.asarray(responsibilities[p_idx], dtype=np.float64)
+            sub_marker_signal += y_p * r_row
+
+    # 4. Qualifying rule.
+    has_marker = (
+        (families_per_taxon >= min_marker_families)
+        & (sub_marker_signal >= min_marker_psms)
+    )
+    for t in excluded_taxa:
+        has_marker[t] = False
+
+    # 5. Compose c_t for this subset, with pi-fallback for non-qualifying.
+    cell_abund = np.zeros(T, dtype=np.float64)
+    if has_marker.any():
+        sel_total = float(sub_marker_signal[has_marker].sum())
+        if sel_total > 0:
+            cell_abund[has_marker] = sub_marker_signal[has_marker] / sel_total
+        else:
+            cell_abund[has_marker] = pi[has_marker]
+    cell_abund[~has_marker] = pi[~has_marker]
+    s = float(cell_abund.sum())
+    if s > 0:
+        cell_abund = cell_abund / s
+    else:
+        cell_abund = pi.copy()
+
+    return SubsetMetrics(
+        cell_abundance=cell_abund,
+        marker_signal=sub_marker_signal,
+        marker_families_per_taxon=families_per_taxon,
+        has_marker_estimate=has_marker,
+        family_signal_per_taxon=dict(fam_signal_per_taxon),
     )
 
 

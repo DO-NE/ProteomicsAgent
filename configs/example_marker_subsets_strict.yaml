@@ -1,0 +1,49 @@
+# ProteomicsAgent — STRICT marker thresholds for stress-testing the qualifying rule.
+# ===================================================================================
+#
+# Same column layout as configs/example_marker_subsets.yaml, but with
+# tighter thresholds — useful for checking how many taxa fall back to
+# pi_t when the marker bar is raised.
+#
+# Run with:
+#
+#   python main.py run \
+#       --config configs/example_marker_subsets_strict.yaml \
+#       --input  /path/to/sample.mzML \
+#       --db     /path/to/reference.fasta \
+#       --no-llm
+
+input: null
+db: null
+output_dir: results/marker_subsets_strict/
+
+no_llm: true
+min_psm_threshold: 2
+detectability_mode: sequence_features
+
+corrections:
+  marker:
+    enabled: true
+    hmm_profile_dir: data/marker_hmms/
+    compute_subsets: true
+    # Stricter HMM matching.
+    evalue: 1.0e-15
+    # Family must contribute >=1.0 fractional PSM to count.
+    min_family_signal: 1.0
+    # Need at least 5 such families AND 3.0 PSMs total.
+    min_marker_families: 5
+    min_marker_psms: 3.0
+
+  proteome_mass:
+    enabled: false
+
+em:
+  init_strategy: unique_psm
+  prior_mode: empirical_bayes
+  prior_kappa: 1500.0
+  prior_alpha0: 0.5
+
+output:
+  plot: true
+  plot_top_n: 15
+  unified_table: true

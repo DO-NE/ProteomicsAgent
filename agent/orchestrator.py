@@ -310,9 +310,16 @@ class Orchestrator:
             config["genome_scaling_exponent"] = float(gse_env)
 
         # Marker-correction thresholds (optional, env-driven via main.py YAML config).
+        _bool_cast = lambda v: str(v).lower() not in ("0", "false", "no")  # noqa: E731
         for env_name, key, cast in (
             ("TAXON_MARKER_MIN_FAMILIES", "min_marker_families", int),
             ("TAXON_MARKER_MIN_PSMS", "min_marker_psms", float),
+            # Cycle 7 — per-family signal threshold.
+            ("TAXON_MARKER_MIN_FAMILY_SIGNAL", "marker_min_family_signal", float),
+            # Cycle 8 — three-subset c_t controls.
+            ("TAXON_MARKER_COMPUTE_SUBSETS", "marker_compute_subsets", _bool_cast),
+            ("TAXON_MARKER_NAYFACH30_TSV", "marker_nayfach30_tsv", str),
+            ("TAXON_MARKER_EVALUE", "marker_evalue", float),
         ):
             if key in params and params[key] is not None:
                 config[key] = cast(params[key])

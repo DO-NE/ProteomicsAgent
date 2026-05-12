@@ -37,6 +37,10 @@ _ENV_VAR_MAP: dict[str, str] = {
     "min_marker_families": "TAXON_MARKER_MIN_FAMILIES",
     "min_marker_psms": "TAXON_MARKER_MIN_PSMS",
     "marker_min_family_signal": "TAXON_MARKER_MIN_FAMILY_SIGNAL",
+    # Cycle 8 — three-subset c_t.
+    "marker_compute_subsets": "TAXON_MARKER_COMPUTE_SUBSETS",
+    "marker_nayfach30_tsv": "TAXON_MARKER_NAYFACH30_TSV",
+    "marker_evalue": "TAXON_MARKER_EVALUE",
     "proteome_mass_correction": "TAXON_PROTEOME_MASS_CORRECTION",
     "genome_scaling_exponent": "TAXON_GENOME_SCALING_EXPONENT",
     "alpha": "TAXON_EM_ALPHA",
@@ -97,6 +101,13 @@ def _flatten_yaml_config(raw: dict) -> dict[str, Any]:
         flat["min_marker_psms"] = float(marker["min_marker_psms"])
     if marker.get("min_family_signal") is not None:
         flat["marker_min_family_signal"] = float(marker["min_family_signal"])
+    # Cycle 8 marker-subset keys.
+    if marker.get("compute_subsets") is not None:
+        flat["marker_compute_subsets"] = bool(marker["compute_subsets"])
+    if marker.get("nayfach30_tsv") is not None:
+        flat["marker_nayfach30_tsv"] = str(marker["nayfach30_tsv"])
+    if marker.get("evalue") is not None:
+        flat["marker_evalue"] = float(marker["evalue"])
 
     em = raw.get("em") or {}
     em_to_flat = {
@@ -211,6 +222,10 @@ def _serialize_run_config(config: dict[str, Any], path: Path) -> None:
         ("min_marker_families", "min_marker_families"),
         ("min_marker_psms", "min_marker_psms"),
         ("marker_min_family_signal", "min_family_signal"),
+        # Cycle 8 — three-subset c_t round-trip.
+        ("marker_compute_subsets", "compute_subsets"),
+        ("marker_nayfach30_tsv", "nayfach30_tsv"),
+        ("marker_evalue", "evalue"),
     ):
         if k_in in flat:
             marker[k_out] = flat.pop(k_in)
@@ -445,6 +460,38 @@ def cli() -> None:
     ),
 )
 @click.option(
+    "--marker-skip-subsets",
+    "marker_skip_subsets",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disable the Cycle-8 three-subset c_t computation. With this flag "
+        "the pipeline computes only c_t_all (legacy behaviour) and the "
+        "ribo/nayfach columns in abundance_results.tsv are zero/false."
+    ),
+)
+@click.option(
+    "--marker-nayfach30-tsv",
+    "marker_nayfach30_tsv",
+    type=click.Path(path_type=Path),
+    default=None,
+    help=(
+        "Path to the Nayfach-30 reference TSV (marker_id\\tko_id\\tdescription). "
+        "Defaults to the bundled file under "
+        "taxon/algorithms/abundance_em_core/data/."
+    ),
+)
+@click.option(
+    "--marker-evalue",
+    "marker_evalue",
+    type=float,
+    default=None,
+    help=(
+        "hmmsearch E-value threshold for marker hits (default 1e-10). "
+        "Lower values demand a stricter marker assignment."
+    ),
+)
+@click.option(
     "--proteome-mass-correction/--no-proteome-mass-correction",
     default=None,
     help="Enable proteome-size-weighted protein-biomass abundance correction",
@@ -504,6 +551,9 @@ def run_cmd(
     min_marker_families: int | None,
     min_marker_psms: float | None,
     marker_min_family_signal: float | None,
+    marker_skip_subsets: bool,
+    marker_nayfach30_tsv: Path | None,
+    marker_evalue: float | None,
     proteome_mass_correction: bool | None,
     genome_scaling_exponent: float | None,
     min_psm_threshold: int | None,
@@ -527,6 +577,13 @@ def run_cmd(
         "min_marker_families": min_marker_families,
         "min_marker_psms": min_marker_psms,
         "marker_min_family_signal": marker_min_family_signal,
+        # --marker-skip-subsets is a store_true flag whose semantic is
+        # "store_false on marker_compute_subsets"; we project it into the
+        # flat key only when the user actually passed the flag, so an
+        # untouched flag leaves the YAML / default value alone.
+        "marker_compute_subsets": (False if marker_skip_subsets else None),
+        "marker_nayfach30_tsv": str(marker_nayfach30_tsv) if marker_nayfach30_tsv else None,
+        "marker_evalue": marker_evalue,
         "proteome_mass_correction": proteome_mass_correction,
         "genome_scaling_exponent": genome_scaling_exponent,
         "min_psm_threshold": min_psm_threshold,
@@ -556,6 +613,16 @@ def run_cmd(
         os.environ["OUTPUT_DIR"] = str(config["output_dir"])
 
     _apply_config_to_env(config)
+
+    # Log the effective merged config once at startup so the user can
+    # confirm what's actually in effect after YAML / CLI / env merge.
+    console.print(
+        Panel(
+            "\n".join(f"{k}: {config[k]}" for k in sorted(config)),
+            title="Effective run config",
+            style="cyan",
+        )
+    )
 
     settings = load_settings()
     if not _startup_checks():
@@ -746,6 +813,34 @@ def start_server_cmd() -> None:
     ),
 )
 @click.option(
+    "--marker-skip-subsets",
+    "marker_skip_subsets",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disable the Cycle-8 three-subset c_t computation. With this flag "
+        "the pipeline computes only c_t_all (legacy behaviour)."
+    ),
+)
+@click.option(
+    "--marker-nayfach30-tsv",
+    "marker_nayfach30_tsv",
+    type=click.Path(path_type=Path),
+    default=None,
+    help=(
+        "Path to the Nayfach-30 reference TSV. Defaults to the bundled file."
+    ),
+)
+@click.option(
+    "--marker-evalue",
+    "marker_evalue",
+    type=float,
+    default=None,
+    help=(
+        "hmmsearch E-value threshold for marker hits (default 1e-10)."
+    ),
+)
+@click.option(
     "--proteome-mass-correction/--no-proteome-mass-correction",
     default=None,
     help="Enable proteome-size-weighted protein-biomass abundance correction",
@@ -803,6 +898,9 @@ def run_pipeline_cmd(
     min_marker_families: int | None,
     min_marker_psms: float | None,
     marker_min_family_signal: float | None,
+    marker_skip_subsets: bool,
+    marker_nayfach30_tsv: Path | None,
+    marker_evalue: float | None,
     proteome_mass_correction: bool | None,
     genome_scaling_exponent: float | None,
     min_psm_threshold: int | None,
@@ -826,6 +924,9 @@ def run_pipeline_cmd(
         "min_marker_families": min_marker_families,
         "min_marker_psms": min_marker_psms,
         "marker_min_family_signal": marker_min_family_signal,
+        "marker_compute_subsets": (False if marker_skip_subsets else None),
+        "marker_nayfach30_tsv": str(marker_nayfach30_tsv) if marker_nayfach30_tsv else None,
+        "marker_evalue": marker_evalue,
         "proteome_mass_correction": proteome_mass_correction,
         "genome_scaling_exponent": genome_scaling_exponent,
         "min_psm_threshold": min_psm_threshold,
@@ -855,6 +956,15 @@ def run_pipeline_cmd(
         os.environ["OUTPUT_DIR"] = str(config["output_dir"])
 
     _apply_config_to_env(config)
+
+    # Log the effective merged config once at startup.
+    console.print(
+        Panel(
+            "\n".join(f"{k}: {config[k]}" for k in sorted(config)),
+            title="Effective run config",
+            style="cyan",
+        )
+    )
 
     settings = load_settings()
     if not _startup_checks():

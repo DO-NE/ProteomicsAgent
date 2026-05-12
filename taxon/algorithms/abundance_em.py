@@ -642,6 +642,70 @@ class AbundanceEMPlugin(TaxonPlugin):
         else:
             _mfs = 0.5
 
+        # --- Cycle-8 three-subset resolution --------------------------------
+        # The bac120/ar53 HMM directory is scanned to extract DESC strings
+        # for every family that fired; the ribo and Nayfach-30 subsets are
+        # derived from those DESC fields.  Failures degrade to legacy
+        # single-subset mode rather than aborting the whole correction.
+        _compute_subsets_cfg = config.get("marker_compute_subsets")
+        _compute_subsets_env = _os.getenv("TAXON_MARKER_COMPUTE_SUBSETS")
+        if _compute_subsets_cfg is not None:
+            compute_subsets = bool(_compute_subsets_cfg)
+        elif _compute_subsets_env is not None and _compute_subsets_env != "":
+            compute_subsets = _compute_subsets_env.lower() not in ("0", "false", "no")
+        else:
+            compute_subsets = True
+
+        subset_families: dict | None = None
+        if compute_subsets:
+            from .abundance_em_core import marker_subset_resolver as _msr
+            nayfach_cfg = config.get("marker_nayfach30_tsv")
+            nayfach_env = _os.getenv("TAXON_MARKER_NAYFACH30_TSV")
+            if nayfach_cfg:
+                nayfach_tsv = Path(str(nayfach_cfg))
+            elif nayfach_env:
+                nayfach_tsv = Path(nayfach_env)
+            else:
+                nayfach_tsv = _msr.DEFAULT_NAYFACH30_TSV
+            try:
+                family_desc = _msr.load_bac120_ar53_descriptions(
+                    Path(str(hmm_profile_dir))
+                )
+                ribo_set, ribo_audit = _msr.identify_ribo_subset(family_desc)
+                nayfach_res = _msr.resolve_nayfach30_to_bac120(
+                    nayfach_tsv, family_desc
+                )
+                logger.info(
+                    "Marker subsets resolved: bac120/ar53 families observed=%d, "
+                    "ribosomal subset=%d, Nayfach-30 subset=%d (unmatched Nayfach ids: %s)",
+                    len(family_desc), len(ribo_set), len(nayfach_res.subset),
+                    nayfach_res.unmatched,
+                )
+                subset_families = {
+                    "all": None,
+                    "ribo": ribo_set,
+                    "nayfach": nayfach_res.subset,
+                }
+                if output_dir_cfg:
+                    try:
+                        _msr.write_subset_diagnostics(
+                            output_dir=Path(str(output_dir_cfg)),
+                            ribo_audit=ribo_audit,
+                            nayfach_resolution=nayfach_res,
+                            family_descriptions=family_desc,
+                            nayfach_tsv_path=nayfach_tsv,
+                        )
+                    except OSError as exc:
+                        logger.warning(
+                            "Failed to write subset diagnostics: %s", exc,
+                        )
+            except (FileNotFoundError, OSError) as exc:
+                logger.warning(
+                    "Subset resolution failed (%s); falling back to single-subset c_t_all",
+                    exc,
+                )
+                subset_families = None
+
         result = compute_cell_equivalent_abundance(
             pi=model.pi_,
             responsibilities=model.responsibilities_,
@@ -656,6 +720,7 @@ class AbundanceEMPlugin(TaxonPlugin):
             min_family_signal=_mfs,
             taxon_kingdom=taxon_kingdom,
             marker_peptide_table_path=marker_peptide_table_path,
+            subset_families=subset_families,
         )
 
         log_marker_diagnostics(result, logger_obj=logger)
@@ -772,9 +837,24 @@ class AbundanceEMPlugin(TaxonPlugin):
     ):
         """Write the single unified ``abundance_results.tsv``.
 
-        Columns: ``taxon_id, taxon_name, psm_abundance, biomass_abundance,
+        Legacy columns
+        --------------
+        ``taxon_id, taxon_name, psm_abundance, biomass_abundance,
         cell_abundance, proteome_size, marker_families, marker_psms,
         has_marker_estimate``.
+
+        Cycle-8 three-subset columns
+        ----------------------------
+        ``c_t_all, c_t_ribo, c_t_nayfach,
+        n_families_all, n_families_ribo, n_families_nayfach,
+        s_t_all, s_t_ribo, s_t_nayfach,
+        has_marker_all, has_marker_ribo, has_marker_nayfach``.
+
+        The legacy ``cell_abundance`` column equals ``c_t_all`` (alias
+        preserved for back-compat); a comment line at the top of the file
+        documents this.  When ``marker_compute_subsets=False`` (or the
+        marker correction was skipped), the ``ribo`` / ``nayfach`` columns
+        are zero / false and ``*_all`` mirrors the legacy values.
 
         - ``biomass_abundance`` mirrors ``psm_abundance`` when proteome-mass
           correction was not run.  When correction is run, this column holds
@@ -804,6 +884,12 @@ class AbundanceEMPlugin(TaxonPlugin):
             biomass = psm.copy()
             proteome_sizes = np.zeros(T, dtype=np.int64)
 
+        # Per-subset vectors.  When marker_result is missing, every subset
+        # degenerates to the psm-fallback view.  When marker_result has
+        # only the legacy "all" subset, ribo/nayfach are zero/false.
+        zeros_f = np.zeros(T, dtype=np.float64)
+        zeros_i = np.zeros(T, dtype=np.int64)
+        zeros_b = np.zeros(T, dtype=bool)
         if marker_result is not None:
             cell = np.asarray(marker_result.cell_abundance, dtype=np.float64)
             marker_families = np.asarray(
@@ -811,19 +897,76 @@ class AbundanceEMPlugin(TaxonPlugin):
             )
             marker_psms = np.asarray(marker_result.marker_psm_count, dtype=np.float64)
             has_marker = np.asarray(marker_result.has_marker_estimate, dtype=bool)
+            subsets = getattr(marker_result, "subsets", {}) or {}
+
+            def _sub(name: str, attr: str, dtype):
+                sm = subsets.get(name)
+                if sm is None:
+                    if name == "all":
+                        # When only legacy fields are populated, mirror them.
+                        return {
+                            "cell_abundance": cell,
+                            "marker_signal": marker_psms,
+                            "marker_families_per_taxon": marker_families,
+                            "has_marker_estimate": has_marker,
+                        }[attr].astype(dtype)
+                    return {
+                        np.float64: zeros_f,
+                        np.int64: zeros_i,
+                        bool: zeros_b,
+                    }[dtype].copy()
+                return np.asarray(getattr(sm, attr), dtype=dtype)
+
+            c_t_all = _sub("all", "cell_abundance", np.float64)
+            c_t_ribo = _sub("ribo", "cell_abundance", np.float64)
+            c_t_nay = _sub("nayfach", "cell_abundance", np.float64)
+            n_fam_all = _sub("all", "marker_families_per_taxon", np.int64)
+            n_fam_ribo = _sub("ribo", "marker_families_per_taxon", np.int64)
+            n_fam_nay = _sub("nayfach", "marker_families_per_taxon", np.int64)
+            s_t_all = _sub("all", "marker_signal", np.float64)
+            s_t_ribo = _sub("ribo", "marker_signal", np.float64)
+            s_t_nay = _sub("nayfach", "marker_signal", np.float64)
+            hm_all = _sub("all", "has_marker_estimate", bool)
+            hm_ribo = _sub("ribo", "has_marker_estimate", bool)
+            hm_nay = _sub("nayfach", "has_marker_estimate", bool)
         else:
             cell = psm.copy()
-            marker_families = np.zeros(T, dtype=np.int64)
-            marker_psms = np.zeros(T, dtype=np.float64)
-            has_marker = np.zeros(T, dtype=bool)
+            marker_families = zeros_i.copy()
+            marker_psms = zeros_f.copy()
+            has_marker = zeros_b.copy()
+            c_t_all = cell.copy()
+            c_t_ribo = zeros_f.copy()
+            c_t_nay = zeros_f.copy()
+            n_fam_all = zeros_i.copy()
+            n_fam_ribo = zeros_i.copy()
+            n_fam_nay = zeros_i.copy()
+            s_t_all = zeros_f.copy()
+            s_t_ribo = zeros_f.copy()
+            s_t_nay = zeros_f.copy()
+            hm_all = zeros_b.copy()
+            hm_ribo = zeros_b.copy()
+            hm_nay = zeros_b.copy()
 
         order = np.argsort(-psm)
         n_written = 0
         with tsv_path.open("w", encoding="utf-8") as fh:
+            # Documentation line: cell_abundance == c_t_all so existing
+            # downstream readers keep working.  When subset computation is
+            # disabled, c_t_ribo / c_t_nayfach are zero and has_marker_ribo
+            # / has_marker_nayfach are false.
+            fh.write(
+                "# cell_abundance == c_t_all (alias preserved for back-compat); "
+                "when marker_compute_subsets=false the ribo/nayfach columns "
+                "are zero/false.\n"
+            )
             fh.write(
                 "taxon_id\ttaxon_name\tpsm_abundance\tbiomass_abundance\t"
                 "cell_abundance\tproteome_size\tmarker_families\t"
-                "marker_psms\thas_marker_estimate\n"
+                "marker_psms\thas_marker_estimate\t"
+                "c_t_all\tc_t_ribo\tc_t_nayfach\t"
+                "n_families_all\tn_families_ribo\tn_families_nayfach\t"
+                "s_t_all\ts_t_ribo\ts_t_nayfach\t"
+                "has_marker_all\thas_marker_ribo\thas_marker_nayfach\n"
             )
             for t in order:
                 lbl = taxon_labels[t]
@@ -849,7 +992,11 @@ class AbundanceEMPlugin(TaxonPlugin):
                     f"{int(proteome_sizes[t])}\t"
                     f"{int(marker_families[t])}\t"
                     f"{marker_psms[t]:.4f}\t"
-                    f"{int(bool(has_marker[t]))}\n"
+                    f"{int(bool(has_marker[t]))}\t"
+                    f"{c_t_all[t]:.6f}\t{c_t_ribo[t]:.6f}\t{c_t_nay[t]:.6f}\t"
+                    f"{int(n_fam_all[t])}\t{int(n_fam_ribo[t])}\t{int(n_fam_nay[t])}\t"
+                    f"{s_t_all[t]:.4f}\t{s_t_ribo[t]:.4f}\t{s_t_nay[t]:.4f}\t"
+                    f"{int(bool(hm_all[t]))}\t{int(bool(hm_ribo[t]))}\t{int(bool(hm_nay[t]))}\n"
                 )
                 n_written += 1
         logger.info(

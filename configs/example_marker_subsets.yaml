@@ -1,0 +1,87 @@
+# ProteomicsAgent — Cycle-8 three-subset c_t example config
+# =========================================================
+#
+# When the marker correction is enabled, the pipeline now emits THREE
+# cell-equivalent abundance columns in abundance_results.tsv:
+#
+#   c_t_all      — using every bac120/ar53 marker family that fired
+#                  (this column is also aliased as `cell_abundance`)
+#   c_t_ribo     — restricted to the ribosomal subset of bac120/ar53
+#                  (auto-detected from each HMM's DESC field)
+#   c_t_nayfach  — restricted to bac120/ar53 families that correspond
+#                  to the 30 MicrobeCensus markers (Nayfach 2015)
+#
+# Each subset is scored against the same qualifying rule
+#   |F_t| >= marker_min_families  AND  s_t >= marker_min_psms
+# where F_t = { f : family_signal[f][t] > marker_min_family_signal }.
+#
+# CLI flags always override these values. To run with the defaults
+# below:
+#
+#   python main.py run \
+#       --config configs/example_marker_subsets.yaml \
+#       --input  /path/to/sample.mzML \
+#       --db     /path/to/reference.fasta \
+#       --no-llm
+
+# --- REQUIRED inputs ---------------------------------------------------
+input: null
+db: null
+output_dir: results/marker_subsets/
+
+# --- Pipeline options --------------------------------------------------
+no_llm: true
+min_psm_threshold: 2
+detectability_mode: sequence_features
+
+# --- Marker correction (Cycle 8) ---------------------------------------
+corrections:
+  marker:
+    enabled: true
+    # Directory of GTDB bac120 / ar53 HMM profile bundles.  Default
+    # layout: bac120_markers.hmm + ar53_markers.hmm (or one *.hmm per
+    # family).  REQUIRED when marker.enabled is true.
+    hmm_profile_dir: data/marker_hmms/
+
+    # Compute c_t_all + c_t_ribo + c_t_nayfach? Set false for the
+    # legacy single-vector behaviour (only c_t_all is computed).
+    compute_subsets: true
+
+    # Path to the Nayfach-30 reference TSV.  Default uses the bundled
+    # file under taxon/algorithms/abundance_em_core/data/nayfach30_markers.tsv.
+    # nayfach30_tsv: /custom/path/to/nayfach30_markers.tsv
+
+    # HMM E-value threshold for marker hits.
+    evalue: 1.0e-10
+
+    # A marker family counts toward |F_t| only if its EM-weighted PSM
+    # signal in taxon t strictly exceeds this value.
+    min_family_signal: 0.5
+
+    # Qualifying thresholds: a taxon receives a marker-based c_t only
+    # when it has at least this many distinct families with non-trivial
+    # signal AND a total fractional marker PSM count of at least
+    # `min_marker_psms`. Otherwise it falls back to pi_t.
+    min_marker_families: 3
+    min_marker_psms: 1.0
+
+  proteome_mass:
+    enabled: false             # set true to also emit b_t in the unified TSV
+    # genome_scaling_exponent: 4.8
+
+# --- EM algorithm ------------------------------------------------------
+em:
+  alpha: 0.5
+  max_iter: 500
+  tol: 1.0e-6
+  init_strategy: unique_psm
+  # --- Prior (Cycle 7) ---
+  prior_mode: empirical_bayes
+  prior_kappa: 1500.0
+  prior_alpha0: 0.5
+
+# --- Output options ----------------------------------------------------
+output:
+  plot: true
+  plot_top_n: 15
+  unified_table: true
