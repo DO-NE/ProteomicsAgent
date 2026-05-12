@@ -89,7 +89,10 @@ def read_abundance_results(path: Path) -> tuple[list[str], np.ndarray, np.ndarra
     pi_vals: list[float] = []
     W_vals: list[float] = []
     with path.open("r", encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
+        # abundance_results.tsv begins with a "#"-prefixed provenance line;
+        # csv has no comment-skip option, so filter manually before parsing.
+        rows = (line for line in fh if not line.lstrip().startswith("#"))
+        reader = csv.DictReader(rows, delimiter="\t")
         required = {"taxon_id", "taxon_name", "psm_abundance", "proteome_size"}
         missing = required.difference(reader.fieldnames or [])
         if missing:

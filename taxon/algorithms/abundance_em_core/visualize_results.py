@@ -74,7 +74,9 @@ def plot_abundance_results(
         )
         return
 
-    df = pd.read_csv(unified_path, sep="\t")
+    # abundance_results.tsv begins with a "#"-prefixed provenance line;
+    # comment='#' makes pandas ignore it.
+    df = pd.read_csv(unified_path, sep="\t", comment="#")
     if df.empty:
         logger.warning("plot_abundance_results: unified result file is empty")
         return
