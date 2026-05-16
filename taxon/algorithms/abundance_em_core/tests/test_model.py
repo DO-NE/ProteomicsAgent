@@ -636,10 +636,12 @@ class TestPrefixCohortInference:
             assert "Chromobacterium violaceum" in label_names
             # No "unclassified" column in the matrix.
             assert "unclassified" not in label_names
-            # With prefix-based bucketing, ZZUNK_peg.1 gets its own "ZZUNK"
-            # taxon column, so LONELYPEPTIDER is matched (not unclassified).
-            assert not any(pep == "LONELYPEPTIDER" for pep, _acc in unclassified)
-            assert any("ZZUNK" in lbl for lbl in taxon_labels)
+            # ZZUNK has only one FASTA entry — the singleton guard keeps
+            # it OUT of the prefix-cohort map, so LONELYPEPTIDER falls
+            # through to the unclassified bucket and no ZZUNK taxon
+            # column is created.
+            assert any(pep == "LONELYPEPTIDER" for pep, _acc in unclassified)
+            assert not any("ZZUNK" in lbl for lbl in taxon_labels)
 
     def test_user_prefix_map_overrides(self):
         with tempfile.TemporaryDirectory() as tmpdir:
